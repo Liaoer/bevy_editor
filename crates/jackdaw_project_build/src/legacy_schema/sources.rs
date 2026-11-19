@@ -11,6 +11,26 @@ use std::{
 
 const INDEX: &str = ".jackdaw/schema-probe/source-inputs.json";
 
+/// Cargo can spell a path inside the project as e.g. vendor/a/../../plugins/b.
+/// Reject paths that leave the project even temporarily. Canonical containment
+/// is checked separately before traversing directories.
+fn project_path(root: &Path, path: &Path) -> bool {
+    use std::path::Component;
+    let Ok(relative) = dunce::simplified(path).strip_prefix(dunce::simplified(root)) else {
+        return false;
+    };
+    let mut depth = 0usize;
+    for part in relative.components() {
+        match part {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir if depth > 0 => depth -= 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub(super) fn record(root: &Path, metadata: &Value) -> io::Result<()> {
     let mut inputs = BTreeSet::new();
     for pkg in metadata["packages"]
@@ -59,6 +79,17 @@ impl SourceScan {
     /// Enumerate membership on every pass; reuse individual content hashes for
     /// unchanged files. The first pass in a new editor always reads the bytes.
     pub fn fingerprint(&mut self, root: &Path) -> io::Result<String> {
+        self.scan(root, false)
+    }
+
+    /// Opening a project may check timestamps, but must not read Rust source
+    /// contents or follow a project-provided inventory outside the project.
+    pub fn metadata_stamp(&mut self, root: &Path) -> io::Result<String> {
+        self.scan(root, true)
+    }
+
+    fn scan(&mut self, root: &Path, metadata_only: bool) -> io::Result<String> {
+        let canonical_root = fs::canonicalize(root)?;
         // An external tool can preserve both size and mtime when replacing a
         // source file. Bound how long that can hide a content change.
         if self
@@ -68,20 +99,31 @@ impl SourceScan {
             self.cached.clear();
             self.last_full_read = Some(Instant::now());
         }
-        let index = match fs::read(root.join(INDEX)) {
-            Ok(index) => index,
+        let index_path = match fs::canonicalize(root.join(INDEX)) {
+            Ok(path) => path,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok("unindexed".into()),
             Err(e) => return Err(e),
         };
+        if !index_path.is_file() || (metadata_only && !index_path.starts_with(&canonical_root)) {
+            return Err(io::Error::other("invalid source inventory"));
+        }
+        let index = fs::read(index_path)?;
         let mut pending: Vec<PathBuf> = serde_json::from_slice(&index)?;
         let mut visited = BTreeSet::new();
         let mut files = BTreeSet::new();
         while let Some(path) = pending.pop() {
+            if metadata_only && !project_path(root, &path) && !project_path(&canonical_root, &path)
+            {
+                return Err(io::Error::other("source outside project"));
+            }
             let resolved = match fs::canonicalize(&path) {
                 Ok(path) => path,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
             };
+            if metadata_only && !resolved.starts_with(&canonical_root) {
+                return Err(io::Error::other("source outside project"));
+            }
             if !visited.insert(resolved.clone()) {
                 continue;
             }
@@ -94,7 +136,7 @@ impl SourceScan {
                         pending.push(entry.path());
                     }
                 }
-            } else {
+            } else if resolved.is_file() {
                 files.insert(resolved);
             }
         }
@@ -104,6 +146,12 @@ impl SourceScan {
             let meta = fs::metadata(&path)?;
             let mtime = meta.modified()?;
             let length = meta.len();
+            if metadata_only {
+                path.hash(&mut combined);
+                mtime.hash(&mut combined);
+                length.hash(&mut combined);
+                continue;
+            }
             let digest = match self.cached.get(&path) {
                 Some(&(t, n, h)) if (t, n) == (mtime, length) => h,
                 _ => {

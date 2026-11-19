@@ -1097,6 +1097,7 @@ pub fn editor_status_bar() -> impl Bundle {
                     ..Default::default()
                 },
                 children![
+                    crate::project_build::legacy_controls::controls(),
                     // Fixed-width clipped box: the build status text changes
                     // length as crates compile, and a bare text node would
                     // reflow the rest of the footer on every frame. Which end

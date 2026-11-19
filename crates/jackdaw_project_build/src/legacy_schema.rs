@@ -408,7 +408,12 @@ debug=0
     {
         return Err("Rust sources changed during schema extraction".into());
     }
-    Ok((fresh, source_before))
+    Ok((
+        fresh,
+        SourceScan::default()
+            .metadata_stamp(root)
+            .unwrap_or_else(|_| "unverified".into()),
+    ))
 }
 
 pub fn publish(dir: &Path, schema: &ProjectSchema, stamp: &str) -> Result<()> {
