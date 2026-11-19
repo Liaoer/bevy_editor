@@ -31,6 +31,7 @@ toml = "1"
 # Sets `[modules]` in an existing jackdaw.toml without disturbing the rest.
 toml_edit = "0.25"
 tracing = { workspace = true }
+tempfile = "3"
 jackdaw_schema.workspace = true
 jackdaw_env.workspace = true
 jackdaw_package.workspace = true
@@ -39,9 +40,6 @@ path-slash.workspace = true
 # `setpriority` for background builds; nothing in std reaches it.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[dev-dependencies]
-tempfile = "3"
 
 [build-dependencies]
 # The build script assembles the embedded SDK-builder recipe: it parses

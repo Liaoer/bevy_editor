@@ -30,6 +30,7 @@ pub mod plan;
 pub mod project_manifest;
 pub mod runtime_wiring;
 pub mod sdk_paths;
+pub mod legacy_schema;
 pub mod shim;
 
 mod binary;

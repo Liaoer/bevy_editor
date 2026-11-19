@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Compile the same wire types and registry exporter with a legacy project's
+/// Bevy. Only JSON crosses between that process and the editor.
+pub const REGISTRY_EXPORT_SOURCE: &str = include_str!("lib.rs");
+
 /// The argument that puts a game into schema-reporting mode.
 ///
 /// The editor/build pipeline passes this; `jackdaw_runtime` answers it.

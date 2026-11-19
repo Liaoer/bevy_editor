@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
+use bevy::tasks::{IoTaskPool, Task, futures_lite::future};
 use jackdaw_api::pie::PlayState;
 
 use crate::build_status::BuildStatus;
@@ -310,14 +311,18 @@ fn watch_project_source_for_edit(world: &mut World) {
 /// second rather than every frame.
 #[derive(Resource)]
 struct ProjectSchemaWatch {
-    last_mtime: Option<std::time::SystemTime>,
+    last_read: Option<(PathBuf, std::time::SystemTime)>,
+    legacy_attempt: Option<(PathBuf, String)>,
+    legacy_task: Option<Task<Result<jackdaw_schema::ProjectSchema, String>>>,
     throttle: Timer,
 }
 
 impl Default for ProjectSchemaWatch {
     fn default() -> Self {
         Self {
-            last_mtime: None,
+            last_read: None,
+            legacy_attempt: None,
+            legacy_task: None,
             throttle: Timer::from_seconds(0.5, TimerMode::Repeating),
         }
     }
@@ -331,27 +336,26 @@ pub(crate) fn forget_project_types(world: &mut World) {
     crate::project_types::publish_document_only_types(world);
 }
 
-/// Refresh the editor's known project component types from
-/// `<project>/.jackdaw/schema.json` whenever that file changes. This is
-/// the single pickup path for project types: the editor's own build and
-/// an out-of-editor `jackdaw build` both write the file, and only this
-/// system reads it into `ProjectTypes`. On editor start it also loads a
-/// schema left by a previous session, so components are known before any
-/// rebuild.
-/// Read `<project>/.jackdaw/schema.json` into `ProjectTypes` and publish
-/// the document-only set, returning the component count when the file was
-/// newer than the last read. `None` means nothing changed and callers
-/// should not re-announce.
+/// Publish the active schema to the Inspector and the document loader.
+/// A legacy project can use its original BSN schema while the background
+/// inventory reader prepares the Jackdaw file. Track the path as well as the
+/// time so switching between those files triggers a refresh.
 pub fn refresh_project_types(world: &mut World) -> Option<usize> {
     let root = world
         .get_resource::<crate::project::ProjectRoot>()
         .map(|p| p.root.clone())?;
-    let jackdaw_dir = root.join(".jackdaw");
+    let mut jackdaw_dir = root.join(".jackdaw");
+    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+        refresh_legacy_schema(world, &root);
+        if !jackdaw_schema::schema_path(&jackdaw_dir).is_file() {
+            jackdaw_dir = root.join(".bsn_editor");
+        }
+    }
     let path = jackdaw_schema::schema_path(&jackdaw_dir);
     let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
     if world
         .get_resource::<ProjectSchemaWatch>()
-        .is_some_and(|watch| watch.last_mtime == Some(mtime))
+        .is_some_and(|watch| watch.last_read.as_ref() == Some(&(path.clone(), mtime)))
     {
         return None;
     }
@@ -366,9 +370,110 @@ pub fn refresh_project_types(world: &mut World) -> Option<usize> {
     crate::project_types::publish_document_only_types(world);
     crate::project_definitions::register_project_definitions(world);
     if let Some(mut watch) = world.get_resource_mut::<ProjectSchemaWatch>() {
-        watch.last_mtime = Some(mtime);
+        watch.last_read = Some((path, mtime));
     }
     Some(component_count)
+}
+
+/// Import the old file immediately and discover the project's linked types off
+/// the UI thread. A worker returns data only; a closed project cannot publish
+/// over a newly opened one.
+fn refresh_legacy_schema(world: &mut World, root: &Path) {
+    let old_dir = root.join(".bsn_editor");
+    let old_path = jackdaw_schema::schema_path(&old_dir);
+    if !old_path.is_file() {
+        return;
+    }
+    let stamp = |path: &Path| {
+        std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos())
+    };
+    let inputs = format!(
+        "v1 {} {} {} {}",
+        stamp(&old_path),
+        stamp(&root.join("Cargo.lock")),
+        stamp(&root.join("Cargo.toml")),
+        stamp(&root.join("bsn_editor.toml"))
+    );
+    let dest = root.join(".jackdaw");
+    let primary = jackdaw_schema::schema_path(&dest);
+    let marker = dest.join("legacy-schema.stamp");
+    let unresolved = world
+        .get_resource::<crate::inspector::unavailable::UnavailableTypes>()
+        .is_some_and(|types| !types.0.is_empty());
+    // The first poll loads the legacy file for immediate use; examine its
+    // field descriptions once they are installed in ProjectTypes.
+    if !primary.exists()
+        && !unresolved
+        && !world
+            .get_resource::<ProjectSchemaWatch>()
+            .is_some_and(|watch| watch.legacy_task.is_some())
+    {
+        let seen = world
+            .get_resource::<ProjectSchemaWatch>()
+            .and_then(|w| w.last_read.as_ref());
+        if !seen.is_some_and(|(path, _)| path == &old_path) {
+            return;
+        }
+        let types = world.resource::<crate::project_types::ProjectTypes>();
+        let registry = world.resource::<AppTypeRegistry>().read();
+        let missing = |field: &jackdaw_schema::FieldSchema| {
+            let path = crate::schema_values::item_type_path(field).unwrap_or(&field.type_path);
+            registry.get_with_type_path(path).is_none() && types.type_schema(path).is_none()
+        };
+        if !types.components().any(|ty| {
+            ty.fields.iter().any(missing)
+                || ty.variants.iter().any(|v| v.fields.iter().any(missing))
+        }) {
+            return;
+        }
+    }
+    let Some(mut watch) = world.get_resource_mut::<ProjectSchemaWatch>() else {
+        return;
+    };
+    if let Some(task) = watch.legacy_task.as_mut() {
+        let Some(result) = future::block_on(future::poll_once(task)) else {
+            return;
+        };
+        watch.legacy_task = None;
+        if watch.legacy_attempt.as_ref() != Some(&(root.to_owned(), inputs.clone())) {
+            return;
+        }
+        let result = result.and_then(|schema| {
+            jackdaw_project_build::legacy_schema::publish(&dest, &schema, &inputs)
+        });
+        if let Err(error) = result {
+            error!("Legacy BSN schema: {error}");
+            if let Some(mut build) = world.get_resource_mut::<BuildStatus>() {
+                build.state = crate::build_status::BuildState::Blocked {
+                    reason: format!("Legacy BSN schema: {error}"),
+                };
+            }
+        } else {
+            info!("Generated project schema from the legacy project's reflection inventory");
+        }
+        return;
+    }
+    if watch.legacy_attempt.as_ref() == Some(&(root.to_owned(), inputs.clone())) {
+        return;
+    }
+    if primary.is_file()
+        && std::fs::read_to_string(&marker).ok().as_deref() == Some(inputs.as_str())
+        && (!unresolved || !watch.last_read.as_ref().is_some_and(|(p, _)| p == &primary))
+    {
+        return;
+    }
+    watch.legacy_attempt = Some((root.to_owned(), inputs));
+    let root = root.to_owned();
+    watch.legacy_task = Some(IoTaskPool::get().spawn(async move {
+        let old = jackdaw_schema::read_schema(&old_dir)
+            .ok_or_else(|| format!("Cannot read {}", old_path.display()))?;
+        jackdaw_project_build::legacy_schema::generate(&root, old)
+    }));
+    info!("Preparing project type schema from legacy BSN metadata");
 }
 
 fn watch_project_schema(world: &mut World) {
