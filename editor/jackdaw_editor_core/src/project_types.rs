@@ -26,6 +26,7 @@ use jackdaw_schema::{FunctionSchema, ProjectSchema, TypeSchema};
 /// extractor on each project build.
 #[derive(Resource, Clone, Default)]
 pub struct ProjectTypes {
+    pub(crate) legacy_bsn: bool,
     components: HashMap<String, TypeSchema>,
     resources: HashMap<String, TypeSchema>,
     events: HashMap<String, TypeSchema>,

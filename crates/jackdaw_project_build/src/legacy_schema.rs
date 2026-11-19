@@ -1,8 +1,10 @@
 //! Legacy BSN projects use their own Bevy dependency graph. Run only a
 //! reflection inventory reader, without constructing a game App or loading a DLL.
+mod sources;
 use jackdaw_env::user_toolchain_command;
 use jackdaw_schema::{ProjectSchema, TypeSchema};
 use serde_json::Value as Json;
+pub use sources::SourceScan;
 use std::{
     collections::HashSet,
     fs,
@@ -125,7 +127,7 @@ fn merge_types(dest: &mut Vec<TypeSchema>, old: Vec<TypeSchema>) {
     dest.extend(old.into_iter().filter(|t| !known.contains(&t.type_path)));
 }
 
-pub fn generate(root: &Path, old: ProjectSchema) -> Result<ProjectSchema> {
+pub fn generate(root: &Path, old: ProjectSchema) -> Result<(ProjectSchema, String)> {
     let settings = read_toml(&root.join("bsn_editor.toml"))?;
     let features: Vec<_> = settings
         .get("features")
@@ -323,6 +325,10 @@ debug=0
         .open(dir.join("prepare.lock"))
         .map_err(|e| e.to_string())?;
     lock.lock().map_err(|e| e.to_string())?;
+    sources::record(root, &meta).map_err(|e| e.to_string())?;
+    let source_before = SourceScan::default()
+        .fingerprint(root)
+        .map_err(|e| e.to_string())?;
     fn install(path: PathBuf, bytes: &[u8]) -> Result<()> {
         if fs::read(&path).ok().as_deref() != Some(bytes) {
             fs::write(path, bytes).map_err(|e| e.to_string())?;
@@ -395,7 +401,14 @@ debug=0
     if !fresh.project_crates.contains(&info.crate_name) {
         fresh.project_crates.push(info.crate_name)
     }
-    Ok(fresh)
+    if SourceScan::default()
+        .fingerprint(root)
+        .map_err(|e| e.to_string())?
+        != source_before
+    {
+        return Err("Rust sources changed during schema extraction".into());
+    }
+    Ok((fresh, source_before))
 }
 
 pub fn publish(dir: &Path, schema: &ProjectSchema, stamp: &str) -> Result<()> {

@@ -64,12 +64,22 @@ fn spawn_one_field(
     path: &str,
     depth: usize,
 ) {
-    if field.type_path == Entity::type_path() && (held.is_u64() || held.is_null()) {
-        let id = held.as_u64().map(|id| id.to_string()).unwrap_or_default();
+    if field.type_path == Entity::type_path() {
+        let (label, id) = if ctx.types.legacy_bsn && (held.is_u64() || held.is_null()) {
+            (
+                "Stable entity ID",
+                held.as_u64().map(|id| id.to_string()).unwrap_or_default(),
+            )
+        } else {
+            (
+                field.name.as_str(),
+                held.as_str().unwrap_or_default().to_owned(),
+            )
+        };
         spawn_editable_field(
             commands,
             parent,
-            "Stable entity ID",
+            label,
             &id,
             path.to_owned(),
             ctx.source,

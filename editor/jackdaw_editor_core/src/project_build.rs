@@ -313,7 +313,16 @@ fn watch_project_source_for_edit(world: &mut World) {
 struct ProjectSchemaWatch {
     last_read: Option<(PathBuf, std::time::SystemTime)>,
     legacy_attempt: Option<(PathBuf, String)>,
-    legacy_task: Option<Task<Result<jackdaw_schema::ProjectSchema, String>>>,
+    legacy_task: Option<Task<Result<(jackdaw_schema::ProjectSchema, String), String>>>,
+    scan: jackdaw_project_build::legacy_schema::SourceScan,
+    scan_task: Option<
+        Task<(
+            jackdaw_project_build::legacy_schema::SourceScan,
+            std::io::Result<String>,
+        )>,
+    >,
+    source_key: Option<String>,
+    next_scan: Instant,
     throttle: Timer,
 }
 
@@ -323,6 +332,10 @@ impl Default for ProjectSchemaWatch {
             last_read: None,
             legacy_attempt: None,
             legacy_task: None,
+            scan: Default::default(),
+            scan_task: None,
+            source_key: None,
+            next_scan: Instant::now(),
             throttle: Timer::from_seconds(0.5, TimerMode::Repeating),
         }
     }
@@ -364,6 +377,8 @@ pub fn refresh_project_types(world: &mut World) -> Option<usize> {
         crate::project_types::native_type_paths(&world.resource::<AppTypeRegistry>().read());
     let component_count = {
         let mut project_types = world.resource_mut::<crate::project_types::ProjectTypes>();
+        project_types.legacy_bsn =
+            jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root);
         project_types.update(&schema, &native);
         project_types.components().count()
     };
@@ -391,8 +406,8 @@ fn refresh_legacy_schema(world: &mut World, root: &Path) {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_nanos())
     };
-    let inputs = format!(
-        "v1 {} {} {} {}",
+    let base = format!(
+        "v2 {} {} {} {}",
         stamp(&old_path),
         stamp(&root.join("Cargo.lock")),
         stamp(&root.join("Cargo.toml")),
@@ -434,6 +449,29 @@ fn refresh_legacy_schema(world: &mut World, root: &Path) {
     let Some(mut watch) = world.get_resource_mut::<ProjectSchemaWatch>() else {
         return;
     };
+    if watch.legacy_task.is_none() {
+        if let Some(task) = watch.scan_task.as_mut() {
+            if let Some((scan, result)) = future::block_on(future::poll_once(task)) {
+                watch.scan_task = None;
+                watch.scan = scan;
+                watch.source_key = result
+                    .map_err(|err| warn!("Legacy schema source scan: {err}"))
+                    .ok();
+                watch.next_scan = Instant::now() + Duration::from_secs(8);
+            }
+        } else if Instant::now() >= watch.next_scan {
+            let root = root.to_owned();
+            let mut scan = std::mem::take(&mut watch.scan);
+            watch.scan_task = Some(IoTaskPool::get().spawn(async move {
+                let key = scan.fingerprint(&root);
+                (scan, key)
+            }));
+        }
+    }
+    let Some(source_key) = watch.source_key.as_ref() else {
+        return;
+    };
+    let inputs = format!("{base} {source_key}");
     if let Some(task) = watch.legacy_task.as_mut() {
         let Some(result) = future::block_on(future::poll_once(task)) else {
             return;
@@ -442,8 +480,13 @@ fn refresh_legacy_schema(world: &mut World, root: &Path) {
         if watch.legacy_attempt.as_ref() != Some(&(root.to_owned(), inputs.clone())) {
             return;
         }
-        let result = result.and_then(|schema| {
-            jackdaw_project_build::legacy_schema::publish(&dest, &schema, &inputs)
+        let result = result.and_then(|(schema, source_key)| {
+            let stamp = format!("{base} {source_key}");
+            jackdaw_project_build::legacy_schema::publish(&dest, &schema, &stamp)?;
+            watch.source_key = Some(source_key);
+            watch.scan_task = None;
+            watch.legacy_attempt = Some((root.to_owned(), stamp));
+            Ok::<(), String>(())
         });
         if let Err(error) = result {
             error!("Legacy BSN schema: {error}");

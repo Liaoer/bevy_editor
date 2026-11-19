@@ -397,7 +397,8 @@ pub fn json_for_bsn(
     type_path: &str,
     value: &BsnValue,
 ) -> Option<Value> {
-    if type_path == Entity::type_path()
+    if types.legacy_bsn
+        && type_path == Entity::type_path()
         && let BsnValue::TupleStruct(data) = value
         && data.type_path == BSN_ENTITY_REF
         && let [BsnValue::Int(id)] = data.values.as_slice()
@@ -572,7 +573,9 @@ pub fn bsn_for_json(
     json: &Value,
 ) -> Option<BsnValue> {
     if type_path == Entity::type_path() {
-        if let Some(id) = json.as_u64().or_else(|| json.as_str()?.parse().ok()) {
+        if types.legacy_bsn
+            && let Some(id) = json.as_u64().or_else(|| json.as_str()?.parse().ok())
+        {
             return Some(BsnValue::TupleStruct(jackdaw_bsn::BsnTupleStructData {
                 type_path: BSN_ENTITY_REF.to_owned(),
                 values: vec![BsnValue::Int(i128::from(id))],
