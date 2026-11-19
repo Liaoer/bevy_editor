@@ -446,6 +446,17 @@ pub fn enter_project_with(world: &mut World, root: PathBuf, skip_build: bool) {
         show_not_a_project_card(world, root, NotAProject::NoManifest);
         return;
     }
+    if project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+        if let Err(error) = project_manifest::ProjectManifest::read_checked(&root) {
+            warn!("Cannot open the BSN project: {error}");
+            show_not_a_project_card(world, root, NotAProject::InvalidManifest(error));
+            return;
+        }
+        info!("Opening BSN project for scene editing: {}", root.display());
+        close_new_project_modal(world);
+        transition_to_editor(world, root);
+        return;
+    }
     // A project without a `jackdaw.toml` has not been set up yet; the
     // import flow proposes exactly what setting it up would write.
     if !project_manifest::ProjectManifest::exists(&root) {
@@ -1294,13 +1305,13 @@ fn show_upgrade_card(
 }
 
 /// Why a folder cannot be opened as a project.
-#[derive(Clone, Copy)]
 enum NotAProject {
     /// The folder is gone: a recent entry pointing at a moved or
     /// deleted directory.
     Missing,
     /// The folder exists but holds no `Cargo.toml`.
     NoManifest,
+    InvalidManifest(String),
 }
 
 /// Refuse to open a folder that is not a project, naming what was
@@ -1308,6 +1319,7 @@ enum NotAProject {
 /// editor rooted at an arbitrary folder looks like success and is not.
 fn show_not_a_project_card(world: &mut World, root: PathBuf, reason: NotAProject) {
     let (_, card, font) = spawn_modal_card(world, 480.0, 640.0);
+    let missing = matches!(reason, NotAProject::Missing);
     let (title, body) = match reason {
         NotAProject::Missing => (
             "That project folder is gone",
@@ -1326,6 +1338,7 @@ fn show_not_a_project_card(world: &mut World, root: PathBuf, reason: NotAProject
                 root.display()
             ),
         ),
+        NotAProject::InvalidManifest(error) => ("Could not read the project settings", error),
     };
     spawn_card_title(world, card, title, &font);
     spawn_card_body(world, card, body, &font);
@@ -1338,7 +1351,7 @@ fn show_not_a_project_card(world: &mut World, root: PathBuf, reason: NotAProject
             commands.queue(close_new_project_modal);
         });
 
-    if matches!(reason, NotAProject::Missing) {
+    if missing {
         let forget = spawn_card_button(world, row, "Remove from list", &font, true);
         world
             .entity_mut(forget)

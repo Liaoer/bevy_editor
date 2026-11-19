@@ -330,6 +330,20 @@ pub(crate) fn prepare_scene_save(world: &mut World) -> Result<PreparedSave, Bevy
         }
     };
     let redirected = legacy_backup.is_some();
+    // Write BSN names back only in a BSN project. Keep the live canonical
+    // paths for the Inspector, asset hooks, history and tab changes.
+    let mut ast = ast;
+    if world
+        .get_resource::<crate::project::ProjectRoot>()
+        .is_some_and(|project| {
+            jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(
+                &project.root,
+            )
+        })
+        && let Some(ast) = &mut ast
+    {
+        jackdaw_bsn::migrate::write_bsn_scene_types(ast);
+    }
     let write = SceneWrite::new(ast, path.clone(), legacy_backup, sidecars);
     let sidecars_started = write.sidecars_started.clone();
     Ok(PreparedSave {

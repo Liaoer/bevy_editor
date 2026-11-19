@@ -92,6 +92,11 @@ pub(crate) fn prebuild_play_target(world: &mut World) {
     let Some(root) = project_root(world) else {
         return;
     };
+    // A BSN manifest admits scene editing only. Do not run a Jackdaw SDK
+    // build or load an existing extension when the project first opens.
+    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+        return;
+    }
     // Loading an extension built in an earlier session compiles nothing, so
     // it does not wait on the pre-build setting.
     if crate::extension_build::load_recorded_build(world, &root) {
@@ -272,6 +277,9 @@ fn watch_project_source_for_edit(world: &mut World) {
     let Some(root) = project_root(world) else {
         return;
     };
+    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+        return;
+    }
     if crate::extension_build::is_extension_project(world, &root, false) {
         // Measured from when the build finished, not from the library's
         // mtime: a change that compiles to nothing new leaves the library
