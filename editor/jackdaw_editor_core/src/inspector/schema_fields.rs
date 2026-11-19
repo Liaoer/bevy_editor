@@ -16,8 +16,8 @@ use crate::project_types::ProjectTypes;
 use crate::schema_values::{item_type_path, native_value_for_json};
 
 use super::reflect_fields::{
-    spawn_enum_menu, spawn_field_row, spawn_list_add_button, spawn_list_row_controls,
-    spawn_text_row,
+    spawn_editable_field, spawn_enum_menu, spawn_field_row, spawn_list_add_button,
+    spawn_list_row_controls, spawn_text_row,
 };
 
 /// Everything the rows need that does not change as the walk descends.
@@ -64,6 +64,30 @@ fn spawn_one_field(
     path: &str,
     depth: usize,
 ) {
+    if field.type_path == Entity::type_path() {
+        let (label, id) = if ctx.types.legacy_bsn && (held.is_u64() || held.is_null()) {
+            (
+                "Stable entity ID",
+                held.as_u64().map(|id| id.to_string()).unwrap_or_default(),
+            )
+        } else {
+            (
+                field.name.as_str(),
+                held.as_str().unwrap_or_default().to_owned(),
+            )
+        };
+        spawn_editable_field(
+            commands,
+            parent,
+            label,
+            &id,
+            path.to_owned(),
+            ctx.source,
+            ctx.type_path,
+            depth,
+        );
+        return;
+    }
     let declared = declared_asset_type(field);
     if let Some(item_type) = item_type_path(field) {
         spawn_list_field(

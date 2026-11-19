@@ -63,6 +63,9 @@ pub fn parse_bsn_text(text: &str) -> Result<SceneBsnAst, BsnLoadError> {
             Cow::Borrowed(_) => return Err(BsnLoadError::Parse(err)),
         },
     };
+    if text.contains("bsn_scene_types::") {
+        crate::migrate::read_bsn_scene_types(&mut ast);
+    }
 
     // Multiple roots emit as a single anonymous entity holding only a Children
     // relation; unwrap it to recover the real roots. A genuine single root that

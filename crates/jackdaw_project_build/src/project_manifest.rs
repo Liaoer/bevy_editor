@@ -16,6 +16,9 @@ use crate::modules::{GameDependencies, ModuleCatalog, ModuleSet};
 /// File name at the project root.
 pub const FILE_NAME: &str = "jackdaw.toml";
 
+/// Scene editing can use the shared settings in an existing BSN manifest.
+const BSN_FILE_NAME: &str = "bsn_editor.toml";
+
 /// The asset folder a project uses when its manifest names none, which is
 /// also where Bevy's `AssetPlugin` looks by default.
 pub const DEFAULT_ASSETS_DIR: &str = "assets";
@@ -76,7 +79,8 @@ pub struct ProjectManifest {
 }
 
 impl ProjectManifest {
-    /// Parse `<root>/jackdaw.toml`. Missing or unreadable yields the
+    /// Parse `<root>/jackdaw.toml`, or the shared fields in a BSN manifest.
+    /// Missing or unreadable yields the
     /// defaults, so callers treat "not set up yet" and "set up with no
     /// overrides" the same way.
     ///
@@ -93,10 +97,25 @@ impl ProjectManifest {
     /// could not be parsed. A missing file is `Ok(default)`: not being
     /// set up is not an error.
     pub fn read_checked(root: &Path) -> Result<Self, String> {
-        let Ok(text) = std::fs::read_to_string(path(root)) else {
-            return Ok(Self::default());
+        let manifest = if Self::uses_bsn_manifest(root) {
+            root.join(BSN_FILE_NAME)
+        } else {
+            path(root)
         };
-        toml::from_str(&text).map_err(|error| error.to_string())
+        match std::fs::read_to_string(&manifest) {
+            Ok(text) => {
+                toml::from_str(&text).map_err(|error| format!("{}: {error}", manifest.display()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(format!("{}: {error}", manifest.display())),
+        }
+    }
+
+    /// A native Jackdaw manifest takes precedence when both files exist.
+    /// BSN-only projects can enter the scene editor without the Jackdaw
+    /// project setup and SDK checks.
+    pub fn uses_bsn_manifest(root: &Path) -> bool {
+        !Self::exists(root) && root.join(BSN_FILE_NAME).is_file()
     }
 
     /// The asset folder relative to the project root. A configured path

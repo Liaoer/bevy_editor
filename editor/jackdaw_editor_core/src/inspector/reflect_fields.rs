@@ -2265,7 +2265,7 @@ fn spawn_numeric_input(
     }
 }
 
-fn spawn_editable_field(
+pub(super) fn spawn_editable_field(
     commands: &mut Commands,
     parent: Entity,
     label: &str,

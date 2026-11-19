@@ -28,6 +28,48 @@
 use std::borrow::Cow;
 
 use crate::syntax::{lex::Token, span::Span};
+use crate::{BsnPatch, SceneBsnAst};
+
+const BSN_SCENE_TYPES: [(&str, &str); 3] = [
+    (
+        "bsn_scene_types::types::GltfSource",
+        "jackdaw_scene_types::types::GltfSource",
+    ),
+    (
+        "bsn_scene_types::types::HiddenInGame",
+        "jackdaw_scene_types::types::HiddenInGame",
+    ),
+    (
+        "bsn_scene_types::node_id::SceneNodeId",
+        "jackdaw_scene_types::node_id::SceneNodeId",
+    ),
+];
+
+pub(crate) fn read_bsn_scene_types(ast: &mut SceneBsnAst) {
+    rewrite_component_paths(ast, &BSN_SCENE_TYPES);
+}
+
+/// Spell the three shared components as BSN names on a disposable save
+/// snapshot. The live document continues to use the registry's names.
+pub fn write_bsn_scene_types(ast: &mut SceneBsnAst) {
+    rewrite_component_paths(ast, &BSN_SCENE_TYPES.map(|(bsn, jackdaw)| (jackdaw, bsn)));
+}
+
+fn rewrite_component_paths(ast: &mut SceneBsnAst, paths: &[(&str, &str)]) {
+    let mut patches = ast.world.query::<&mut BsnPatch>();
+    for mut patch in patches.iter_mut(&mut ast.world) {
+        // Rewrite component keys, leaving names, literals, and game types alone.
+        let path = match &mut *patch {
+            BsnPatch::Type(path) => path,
+            BsnPatch::Struct(data) => &mut data.type_path,
+            BsnPatch::TupleStruct(data) => &mut data.type_path,
+            _ => continue,
+        };
+        if let Some((_, replacement)) = paths.iter().find(|(old, _)| path.as_str() == *old) {
+            *path = (*replacement).to_owned();
+        }
+    }
+}
 
 /// The start of a scene's version stamp line.
 pub const STAMP_MARKER: &str = "// jackdaw ";
