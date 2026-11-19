@@ -1,3 +1,5 @@
+mod project_fields;
+
 use std::any::TypeId;
 
 use bevy::{
@@ -101,6 +103,12 @@ fn resolve_field_edit_old_value(
 ) -> Option<jackdaw_bsn::BsnValue> {
     if let Some(authored) = authored_bsn_field(world, entity, type_path, field_path) {
         return Some(authored);
+    }
+    if world
+        .get_resource::<crate::project_types::ProjectTypes>()
+        .is_some_and(|types| types.is_project_component(type_path))
+    {
+        return None; // Undo a newly authored field to absence.
     }
     if let Some(omitted) = omitted_list_field(world, entity, type_path, field_path) {
         return Some(omitted);
@@ -1668,7 +1676,7 @@ impl SetBsnField {
         {
             self.old_value = live_bsn_field(world, self.entity, &self.type_path, &self.field_path);
         }
-        if self.old_value.is_none() {
+        if !is_project && self.old_value.is_none() {
             self.old_value =
                 omitted_list_field(world, self.entity, &self.type_path, &self.field_path);
         }
@@ -1766,6 +1774,12 @@ impl SetBsnField {
                 }
             } else if removes_component {
                 ast.remove_component_patch(patches_entity, &self.type_path);
+            } else if removes_field && is_project && self.field_path.contains('.') {
+                if let Some(id) = ast.find_patch_by_type_path(patches_entity, &self.type_path)
+                    && let Some(mut patch) = ast.world.get_mut::<jackdaw_bsn::BsnPatch>(id)
+                {
+                    project_fields::write_nested(&mut patch, &self.field_path, None);
+                }
             } else if removes_field && tuple_defaults.is_some() {
                 remove_project_tuple_field(
                     &mut ast,
@@ -2385,8 +2399,7 @@ pub(crate) fn json_field_edit(
         // Project (schema-reported) components have no editor registration; the
         // field's authored value comes straight from the extracted schema type.
         drop(registry);
-        return project_field_edit_to_bsn_value(world, entity, type_path, field_path, value)
-            .map(|new_value| (field_path.to_string(), new_value))
+        return project_fields::edit(world, entity, type_path, field_path, value)
             .ok_or_else(|| refused(format!("`{field_path}` does not take {value}")));
     };
     if field_path.is_empty() {
@@ -2568,67 +2581,6 @@ fn authorable(
         .ok()
 }
 
-/// Convert a field edit on a project (schema-reported) component into the
-/// [`jackdaw_bsn::BsnValue`] to author, without an editor registration. The
-/// value is read as the field's schema type, so a type the editor does know --
-/// a colour, an asset path -- converts through its own registration, and a
-/// value the type does not take is refused rather than authored as its own
-/// JSON text.
-///
-/// A path reaching past the field itself is merged into the field's current
-/// value, so `tint.Srgba.red` writes one channel of the colour the field
-/// already holds and the answer is still the whole field, which is what
-/// [`set_project_field`] authors.
-fn project_field_edit_to_bsn_value(
-    world: &World,
-    entity: Entity,
-    type_path: &str,
-    field_path: &str,
-    value: &serde_json::Value,
-) -> Option<jackdaw_bsn::BsnValue> {
-    use crate::schema_values::{self, Step};
-
-    let types = world.get_resource::<crate::project_types::ProjectTypes>()?;
-    let schema = types.component(type_path)?;
-    let steps = schema_values::parse_path(field_path);
-    let Some(Step::Field(name)) = steps.first() else {
-        return schema_values::bsn_for_json(world, types, type_path, value);
-    };
-    let field = schema.fields.iter().find(|f| &f.name == name)?;
-    if steps.len() == 1 {
-        return schema_values::bsn_for_json(world, types, &field.type_path, value);
-    }
-
-    let mut held = authored_project_field_json(world, entity, types, schema, field)?;
-    if !schema_values::json_set(&mut held, &steps[1..], value.clone()) {
-        warn!("`{field_path}` does not reach into the value `{type_path}` holds");
-        return None;
-    }
-    schema_values::bsn_for_json(world, types, &field.type_path, &held)
-}
-
-/// One field of a project component as JSON: what the document authors for it,
-/// and the type's default where the document is silent.
-fn authored_project_field_json(
-    world: &World,
-    entity: Entity,
-    types: &crate::project_types::ProjectTypes,
-    schema: &jackdaw_schema::TypeSchema,
-    field: &jackdaw_schema::FieldSchema,
-) -> Option<serde_json::Value> {
-    let authored = world
-        .get_resource::<jackdaw_bsn::SceneBsnAst>()
-        .and_then(|ast| {
-            let node = ast.ast_for(entity)?;
-            let patch = ast.find_patch_by_type_path(node, &schema.type_path)?;
-            crate::schema_values::authored_fields(ast.get_patch(patch)?)
-        });
-    match authored {
-        Some(data) => crate::schema_values::field_json(world, types, schema, &data, field),
-        None => crate::schema_values::default_field_json(schema, &field.name),
-    }
-}
-
 /// The default of each position of a project tuple struct, as BSN, or `None`
 /// when the project type is not a tuple struct. A position whose default
 /// cannot be spelled is `None`.
@@ -2656,9 +2608,7 @@ fn project_tuple_defaults(
 /// Author a field value on a project component's document patch without a
 /// registration. Project types are never in the editor registry, so the
 /// registry-gated [`jackdaw_bsn::set_bsn_field`] refuses them; this upserts the
-/// named field directly on the node's struct patch instead. A path reaching
-/// deeper names the same top-level field, whose whole new value
-/// [`project_field_edit_to_bsn_value`] has already merged.
+/// named field directly on the node's struct patch instead. Nested paths address fields and indices in the authored BSN tree.
 ///
 /// `tuple_defaults` is given for a tuple struct, whose fields are named by
 /// position: the value is written at its position in a tuple patch, and any
@@ -2688,6 +2638,10 @@ fn set_project_field(
         return;
     };
     let patch = patch.into_inner();
+    if field_path.contains('.') {
+        project_fields::write_nested(patch, field_path, Some(value));
+        return;
+    }
     if let jackdaw_bsn::BsnPatch::Type(existing) = patch {
         let type_path = existing.clone();
         *patch = if tuple_defaults.is_some() {

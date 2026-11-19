@@ -14,6 +14,8 @@ use serde_json::Value;
 use crate::project_types::ProjectTypes;
 use crate::scene_io::asset_names::AssetReferences;
 
+const BSN_ENTITY_REF: &str = "bsn_scene::EntityRef";
+
 /// One step of a field path: `loot[0].item` is a field, an index and a field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -395,14 +397,21 @@ pub fn json_for_bsn(
     type_path: &str,
     value: &BsnValue,
 ) -> Option<Value> {
+    if type_path == Entity::type_path()
+        && let BsnValue::TupleStruct(data) = value
+        && data.type_path == BSN_ENTITY_REF
+        && let [BsnValue::Int(id)] = data.values.as_slice()
+    {
+        return Some(Value::from(u64::try_from(*id).ok()?));
+    }
     if let Some(item_type) = list_item_type_path(type_path)
         && let BsnValue::List(items) = value
     {
         return Some(Value::Array(
             items
                 .iter()
-                .filter_map(|item| json_for_bsn(world, types, item_type, item))
-                .collect(),
+                .map(|item| json_for_bsn(world, types, item_type, item))
+                .collect::<Option<_>>()?,
         ));
     }
     if let Some(schema) = types.type_schema(type_path) {
@@ -426,20 +435,31 @@ fn project_json_for_bsn(
             let BsnValue::Struct(data) = value else {
                 return scalar_json(value);
             };
-            Some(value_json(world, types, schema, data))
+            let fields = data.fields.0.iter().map(|authored| {
+                let field = schema
+                    .fields
+                    .iter()
+                    .find(|field| field.name == authored.name)?;
+                Some((
+                    authored.name.clone(),
+                    json_for_bsn(world, types, &field.type_path, &authored.value)?,
+                ))
+            });
+            Some(Value::Object(fields.collect::<Option<_>>()?))
         }
         TypeKind::TupleStruct => {
             let BsnValue::TupleStruct(data) = value else {
                 return scalar_json(value);
             };
+            if data.values.len() > schema.fields.len() {
+                return None;
+            }
             Some(Value::Array(
                 data.values
                     .iter()
                     .zip(&schema.fields)
-                    .filter_map(|(value, field)| {
-                        json_for_bsn(world, types, &field.type_path, value)
-                    })
-                    .collect(),
+                    .map(|(value, field)| json_for_bsn(world, types, &field.type_path, value))
+                    .collect::<Option<_>>()?,
             ))
         }
         TypeKind::Marker => scalar_json(value),
@@ -457,6 +477,7 @@ fn enum_json_for_bsn(
     let variant_of = |spelled: &str| -> String {
         spelled
             .strip_prefix(&format!("{}::", schema.type_path))
+            .or_else(|| spelled.strip_prefix(&format!("{}::", enum_bsn_path(schema))))
             .unwrap_or(spelled)
             .to_string()
     };
@@ -466,10 +487,18 @@ fn enum_json_for_bsn(
         BsnValue::Struct(data) => {
             let name = variant_of(&data.type_path);
             let variant = schema.variants.iter().find(|known| known.name == name)?;
+            if data.fields.0.iter().any(|authored| {
+                !variant
+                    .fields
+                    .iter()
+                    .any(|field| field.name == authored.name)
+            }) {
+                return None;
+            }
             let mut object = serde_json::Map::new();
             for field in &variant.fields {
                 let json = match authored(data, &field.name) {
-                    Some(authored) => json_for_bsn(world, types, &field.type_path, authored),
+                    Some(authored) => Some(json_for_bsn(world, types, &field.type_path, authored)?),
                     None => default_json(world, types, &field.type_path),
                 };
                 if let Some(json) = json {
@@ -481,18 +510,20 @@ fn enum_json_for_bsn(
         BsnValue::TupleStruct(data) => {
             let name = variant_of(&data.type_path);
             let variant = schema.variants.iter().find(|known| known.name == name)?;
+            if data.values.len() > variant.fields.len() {
+                return None;
+            }
             let items: Vec<Value> = variant
                 .fields
                 .iter()
                 .enumerate()
-                .map(|(index, field)| {
-                    match data.values.get(index) {
-                        Some(value) => json_for_bsn(world, types, &field.type_path, value),
-                        None => default_json(world, types, &field.type_path),
+                .map(|(index, field)| match data.values.get(index) {
+                    Some(value) => json_for_bsn(world, types, &field.type_path, value),
+                    None => {
+                        Some(default_json(world, types, &field.type_path).unwrap_or(Value::Null))
                     }
-                    .unwrap_or(Value::Null)
                 })
-                .collect();
+                .collect::<Option<_>>()?;
             Some(serde_json::json!({ name: Value::Array(items) }))
         }
         _ => scalar_json(value),
@@ -540,14 +571,23 @@ pub fn bsn_for_json(
     type_path: &str,
     json: &Value,
 ) -> Option<BsnValue> {
+    if type_path == Entity::type_path() {
+        if let Some(id) = json.as_u64().or_else(|| json.as_str()?.parse().ok()) {
+            return Some(BsnValue::TupleStruct(jackdaw_bsn::BsnTupleStructData {
+                type_path: BSN_ENTITY_REF.to_owned(),
+                values: vec![BsnValue::Int(i128::from(id))],
+            }));
+        }
+        return native_bsn_for_json(world, type_path, json);
+    }
     if let Some(item_type) = list_item_type_path(type_path)
         && let Value::Array(items) = json
     {
         return Some(BsnValue::List(
             items
                 .iter()
-                .filter_map(|item| bsn_for_json(world, types, item_type, item))
-                .collect(),
+                .map(|item| bsn_for_json(world, types, item_type, item))
+                .collect::<Option<_>>()?,
         ));
     }
     if let Some(schema) = types.type_schema(type_path) {
@@ -574,12 +614,10 @@ fn project_bsn_for_json(
                 let Some(value) = object.get(&field.name) else {
                     continue;
                 };
-                if let Some(value) = bsn_for_json(world, types, &field.type_path, value) {
-                    fields.push(BsnField {
-                        name: field.name.clone(),
-                        value,
-                    });
-                }
+                fields.push(BsnField {
+                    name: field.name.clone(),
+                    value: bsn_for_json(world, types, &field.type_path, value)?,
+                });
             }
             Some(BsnValue::Struct(BsnStructData {
                 type_path: schema.type_path.clone(),
@@ -593,8 +631,8 @@ fn project_bsn_for_json(
                 values: items
                     .iter()
                     .zip(&schema.fields)
-                    .filter_map(|(item, field)| bsn_for_json(world, types, &field.type_path, item))
-                    .collect(),
+                    .map(|(item, field)| bsn_for_json(world, types, &field.type_path, item))
+                    .collect::<Option<_>>()?,
             }))
         }
         TypeKind::Marker => scalar_bsn(json),
@@ -612,19 +650,19 @@ fn enum_bsn_for_json(
         if !known && !schema.variants.is_empty() {
             return None;
         }
-        return Some(BsnValue::Type(format!("{}::{name}", schema.type_path)));
+        return Some(BsnValue::Type(format!("{}::{name}", enum_bsn_path(schema))));
     }
     let (name, body) = json.as_object()?.iter().next()?;
     let variant = schema.variants.iter().find(|known| &known.name == name)?;
-    let type_path = format!("{}::{name}", schema.type_path);
+    let type_path = format!("{}::{name}", enum_bsn_path(schema));
     if let Some(items) = body.as_array() {
         return Some(BsnValue::TupleStruct(jackdaw_bsn::BsnTupleStructData {
             type_path,
             values: items
                 .iter()
                 .zip(&variant.fields)
-                .filter_map(|(item, field)| bsn_for_json(world, types, &field.type_path, item))
-                .collect(),
+                .map(|(item, field)| bsn_for_json(world, types, &field.type_path, item))
+                .collect::<Option<_>>()?,
         }));
     }
     let object = body.as_object()?;
@@ -633,17 +671,23 @@ fn enum_bsn_for_json(
         let Some(value) = object.get(&field.name) else {
             continue;
         };
-        if let Some(value) = bsn_for_json(world, types, &field.type_path, value) {
-            fields.push(BsnField {
-                name: field.name.clone(),
-                value,
-            });
-        }
+        fields.push(BsnField {
+            name: field.name.clone(),
+            value: bsn_for_json(world, types, &field.type_path, value)?,
+        });
     }
     Some(BsnValue::Struct(BsnStructData {
         type_path,
         fields: BsnStructFields(fields),
     }))
+}
+
+fn enum_bsn_path(schema: &TypeSchema) -> &str {
+    if schema.type_path.starts_with("core::option::Option<") {
+        "core::option::Option"
+    } else {
+        &schema.type_path
+    }
 }
 
 /// A value of a type the editor has a registration for: text takes the

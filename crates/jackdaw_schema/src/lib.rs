@@ -300,7 +300,7 @@ mod extract {
     /// `ReflectComponent` beside itself.
     pub fn extract_from_registry(
         registry: &TypeRegistry,
-        project: &ProjectCrates,
+        _project: &ProjectCrates,
     ) -> ProjectSchema {
         let mut schema = ProjectSchema::default();
         for registration in registry.iter() {
@@ -321,15 +321,19 @@ mod extract {
                 schema.components.push(type_schema);
             }
         }
+        // A registered component can belong to a plugin outside the workspace.
+        // Its concrete fields still need to be described for scene editing.
         schema.field_types = describe_types_reached_by(
             registry,
             schema
                 .components
                 .iter()
-                .filter(|component| project.includes(crate_segment(&component.type_path)))
                 .map(|component| component.type_path.as_str()),
             false,
-            |path| project.includes(crate_segment(path)),
+            |path| {
+                !is_standard_library(crate_segment(path))
+                    || path.starts_with("core::option::Option<")
+            },
         );
         schema
     }
@@ -690,6 +694,7 @@ mod extract {
                 }
             }
             TypeInfo::Enum(e) if is_option(e) => {
+                reached.push(info.type_path().to_string());
                 for variant in e.iter() {
                     reach_into_variant(variant, reached);
                 }

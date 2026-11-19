@@ -154,7 +154,10 @@ impl ProjectTypes {
         self.field_types = schema
             .field_types
             .iter()
-            .filter(|reached| !native.contains(&reached.type_path))
+            .filter(|reached| {
+                reached.type_path == Option::<Entity>::type_path()
+                    || !native.contains(&reached.type_path)
+            })
             .filter(|reached| !self.components.contains_key(&reached.type_path))
             .map(|reached| (reached.type_path.clone(), reached.clone()))
             .collect();
