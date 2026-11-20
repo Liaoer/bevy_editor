@@ -1,0 +1,13 @@
+[package]
+name = "jackdaw_builder"
+version.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bevy.workspace = true
+jackdaw_api.workspace = true
+jackdaw_geometry.workspace = true
+jackdaw_env.workspace = true
+serde_json.workspace = true
+tempfile = "3"
