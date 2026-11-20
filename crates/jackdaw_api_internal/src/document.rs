@@ -16,6 +16,46 @@
 use bevy::ecs::component::Mutable;
 use bevy::prelude::*;
 
+pub use jackdaw_bsn::BsnValue as AuthoredValue;
+
+/// Read-only access to authored values, including unsaved changes and stable references.
+/// The returned component is an owned snapshot; writes go through component.set.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct AuthoredComponents<'w> {
+    ast: Option<Res<'w, jackdaw_bsn::SceneBsnAst>>,
+}
+impl AuthoredComponents<'_> {
+    pub fn snapshot(&self, entity: Entity, component: &str) -> Option<AuthoredValue> {
+        let ast = self.ast.as_ref()?;
+        jackdaw_bsn::get_bsn_field(ast, ast.ast_for(entity)?, component, "")
+    }
+    pub fn entities_with<'a>(&'a self, component: &'a str) -> impl Iterator<Item = Entity> + 'a {
+        self.ast.iter().flat_map(move |ast| {
+            ast.ast_to_ecs.iter().filter_map(move |(node, entity)| {
+                ast.find_patch_by_type_path(*node, component)
+                    .map(|_| *entity)
+            })
+        })
+    }
+    pub fn is_changed(&self) -> bool {
+        self.ast.as_ref().is_some_and(|a| a.is_changed())
+    }
+    pub fn stable_id(&self, entity: Entity) -> Option<u64> {
+        let ast = self.ast.as_ref()?;
+        ast.stable_id_of(ast.ast_for(entity)?)
+    }
+    pub fn to_bsn(value: &AuthoredValue) -> String {
+        jackdaw_bsn::emit_value_text(value)
+    }
+}
+/// Read a fresh snapshot when committing a queued operator.
+impl SceneDocument {
+    pub fn snapshot(world: &World, entity: Entity, component: &str) -> Option<AuthoredValue> {
+        let ast = world.get_resource::<jackdaw_bsn::SceneBsnAst>()?;
+        jackdaw_bsn::get_bsn_field(ast, ast.ast_for(entity)?, component, "")
+    }
+}
+
 /// Reads the open scene's document. The editor installs the
 /// implementation.
 pub trait DocumentReader: Send + Sync + 'static {
