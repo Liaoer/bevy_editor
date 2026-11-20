@@ -28,7 +28,7 @@ fn main() {
 
 type Result<T> = std::result::Result<T, String>;
 
-fn run(cmd: &mut Command) -> Result<Vec<u8>> {
+pub(super) fn run(cmd: &mut Command) -> Result<Vec<u8>> {
     let output = cmd.output().map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
@@ -36,7 +36,7 @@ fn run(cmd: &mut Command) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn read_toml(path: &Path) -> Result<Table> {
+pub(super) fn read_toml(path: &Path) -> Result<Table> {
     fs::read_to_string(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .parse()
@@ -50,7 +50,7 @@ fn manifest_dir(package: &Json) -> Result<&Path> {
         .ok_or_else(|| "missing Cargo manifest path".into())
 }
 
-fn dependency(package: &Json) -> Result<Table> {
+pub(super) fn dependency(package: &Json) -> Result<Table> {
     let mut spec = Table::new();
     let name = package["name"].as_str().ok_or("missing package name")?;
     spec.insert("package".into(), name.into());
@@ -106,7 +106,7 @@ fn package_by_id<'a>(meta: &'a Json, id: &str) -> Result<&'a Json> {
         .ok_or_else(|| format!("unknown Cargo package {id}"))
 }
 
-fn linked<'a>(meta: &'a Json, parent: &Json, name: &str) -> Result<&'a Json> {
+pub(super) fn linked<'a>(meta: &'a Json, parent: &Json, name: &str) -> Result<&'a Json> {
     let node = meta["resolve"]["nodes"]
         .as_array()
         .into_iter()
@@ -125,6 +125,37 @@ fn linked<'a>(meta: &'a Json, parent: &Json, name: &str) -> Result<&'a Json> {
 fn merge_types(dest: &mut Vec<TypeSchema>, old: Vec<TypeSchema>) {
     let known: HashSet<_> = dest.iter().map(|t| t.type_path.clone()).collect();
     dest.extend(old.into_iter().filter(|t| !known.contains(&t.type_path)));
+}
+
+pub(super) fn workspace_patches(workspace: &Path, manifest: &mut Table) -> Result<()> {
+    if let Some(mut patches) = read_toml(&workspace.join("Cargo.toml"))?.remove("patch") {
+        for group in patches
+            .as_table_mut()
+            .into_iter()
+            .flat_map(|t| t.iter_mut().map(|(_, value)| value))
+        {
+            for spec in group
+                .as_table_mut()
+                .into_iter()
+                .flat_map(|t| t.iter_mut().map(|(_, value)| value))
+            {
+                if let Some(path) = spec.get_mut("path")
+                    && let Some(rel) = path.as_str()
+                {
+                    *path = workspace.join(rel).to_string_lossy().as_ref().into();
+                }
+            }
+        }
+        manifest.insert("patch".into(), patches);
+    }
+    Ok(())
+}
+
+pub(super) fn install(path: PathBuf, bytes: &[u8]) -> Result<()> {
+    if fs::read(&path).ok().as_deref() != Some(bytes) {
+        fs::write(path, bytes).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn generate(root: &Path, old: ProjectSchema) -> Result<(ProjectSchema, String)> {
@@ -291,26 +322,7 @@ debug=0
         deps.insert(alias.clone(), Value::Table(dependency(package)?));
         source.push_str(&format!("\nextern crate {alias} as _;\n"));
     }
-    if let Some(mut patches) = read_toml(&workspace.join("Cargo.toml"))?.remove("patch") {
-        for group in patches
-            .as_table_mut()
-            .into_iter()
-            .flat_map(|t| t.iter_mut().map(|(_, value)| value))
-        {
-            for spec in group
-                .as_table_mut()
-                .into_iter()
-                .flat_map(|t| t.iter_mut().map(|(_, value)| value))
-            {
-                if let Some(path) = spec.get_mut("path")
-                    && let Some(rel) = path.as_str()
-                {
-                    *path = workspace.join(rel).to_string_lossy().as_ref().into();
-                }
-            }
-        }
-        manifest.insert("patch".into(), patches);
-    }
+    workspace_patches(&workspace, &mut manifest)?;
     let jackdaw = root.join(".jackdaw");
     fs::create_dir_all(&jackdaw).map_err(|e| e.to_string())?;
     let dir = jackdaw.join("schema-probe");
@@ -329,12 +341,6 @@ debug=0
     let source_before = SourceScan::default()
         .fingerprint(root)
         .map_err(|e| e.to_string())?;
-    fn install(path: PathBuf, bytes: &[u8]) -> Result<()> {
-        if fs::read(&path).ok().as_deref() != Some(bytes) {
-            fs::write(path, bytes).map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
     install(
         dir.join("Cargo.toml"),
         toml::to_string(&manifest)

@@ -1,4 +1,4 @@
-//! Project run configurations read from `jackdaw.toml`.
+//! Project run configurations read from the native or legacy project manifest.
 
 use std::path::Path;
 
@@ -27,7 +27,12 @@ pub fn read_run_configs(world: &mut World) {
 }
 
 fn load_manifest(root: &Path) -> Manifest {
-    let path = root.join("jackdaw.toml");
+    let path = if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(root)
+    {
+        root.join("bsn_editor.toml")
+    } else {
+        root.join("jackdaw.toml")
+    };
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_manifest_str(&text),
         Err(_) => synthesize_default(root),
@@ -39,7 +44,7 @@ fn parse_manifest_str(text: &str) -> Manifest {
     match toml::from_str::<Manifest>(text) {
         Ok(m) => m,
         Err(err) => {
-            warn!("jackdaw.toml parse error: {err}");
+            warn!("Run configuration parse error: {err}");
             Manifest::default()
         }
     }

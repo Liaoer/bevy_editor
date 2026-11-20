@@ -43,6 +43,7 @@ dylib = ["dep:jackdaw_sdk", "jackdaw_api/dynamic_linking", "jackdaw_project_buil
 embed-recipe = ["jackdaw_project_build/embed-recipe"]
 
 [dependencies]
+tempfile = "3"
 bevy = { workspace = true, features = [
     "system_font_discovery",
     "system_clipboard",
@@ -165,9 +166,6 @@ libc = "0.2"
 fontique = { version = "0.11", default-features = false, features = [
     "fontconfig-dlopen",
 ] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [lints]
 workspace = true

@@ -152,58 +152,14 @@ pub fn build_project_binary_cancellable(
     }
 
     let mut command = game_build_command(spec, &target_dir, load);
-    let mut child = command.spawn()?;
-
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = StderrCapture::take(&mut child);
-    let lines = lines_on_a_thread(stdout);
-    let mut done = 0u32;
-    let mut log = String::new();
-    let mut executables: Vec<PathBuf> = Vec::new();
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
-            report(BuildEvent::Log("build cancelled".to_string()));
-            return Err(ProjectBuildError::Io(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "build cancelled",
-            )));
-        }
-        match lines.recv_timeout(CANCEL_POLL) {
-            Ok(line) => {
-                if let Some(path) = executable_for_package(&line, &spec.package_name) {
-                    executables.push(path);
-                }
-                parse_build_line(&line, &mut done, &mut log, report);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    let status = child.wait()?;
-    if !status.success() {
-        let stderr = stderr.finish();
-        // Cargo's own account of the failure never goes through the JSON stream.
-        // `Display` for `Compile` is one line, so the detail has to reach the
-        // panel line by line the way rustc's diagnostics do.
-        for line in stderr.lines() {
-            report(BuildEvent::Log(line.to_string()));
-        }
-        return Err(ProjectBuildError::Compile {
-            log: with_toolchain_hint(
-                compile_failure_log(log, &stderr),
-                &stderr,
-                &spec.project_root,
-            ),
-        });
-    }
-
-    let binary = executables
-        .pop()
-        .ok_or_else(|| ProjectBuildError::Compile {
-            log: no_binary_message(spec),
-        })?;
+    let binary = compile_binary(
+        &mut command,
+        &spec.package_name,
+        &spec.project_root,
+        cancel,
+        report,
+        || no_binary_message(spec),
+    )?;
 
     // Ask the freshly built game for its types: a throwaway run that prints and
     // exits. A failure here is not fatal, and the editor keeps its prior schema.
@@ -225,6 +181,66 @@ pub fn build_project_binary_cancellable(
     }
 
     Ok(ProjectBinaryBuild { binary, schema })
+}
+
+pub(super) fn compile_binary(
+    command: &mut Command,
+    package: &str,
+    project_root: &Path,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(BuildEvent),
+    missing_binary: impl FnOnce() -> String,
+) -> Result<PathBuf, ProjectBuildError> {
+    let mut child = command.spawn()?;
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = StderrCapture::take(&mut child);
+    let lines = lines_on_a_thread(stdout);
+    let mut done = 0u32;
+    let mut log = String::new();
+    let mut executables: Vec<PathBuf> = Vec::new();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            report(BuildEvent::Log("build cancelled".to_string()));
+            return Err(ProjectBuildError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "build cancelled",
+            )));
+        }
+        match lines.recv_timeout(CANCEL_POLL) {
+            Ok(line) => {
+                if let Some(path) = executable_for_package(&line, package) {
+                    executables.push(path);
+                }
+                parse_build_line(&line, &mut done, &mut log, report);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        let stderr = stderr.finish();
+        // Cargo's own account of the failure never goes through the JSON stream.
+        // `Display` for `Compile` is one line, so the detail has to reach the
+        // panel line by line the way rustc's diagnostics do.
+        for line in stderr.lines() {
+            report(BuildEvent::Log(line.to_string()));
+        }
+        return Err(ProjectBuildError::Compile {
+            log: with_toolchain_hint(compile_failure_log(log, &stderr), &stderr, project_root),
+        });
+    }
+
+    let binary = executables
+        .pop()
+        .ok_or_else(|| ProjectBuildError::Compile {
+            log: missing_binary(),
+        })?;
+
+    Ok(binary)
 }
 
 /// Profile overrides for a game the editor builds. A game spends its load and
