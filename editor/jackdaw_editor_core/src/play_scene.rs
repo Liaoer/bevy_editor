@@ -104,6 +104,60 @@ fn scene_in_front(world: &World) -> Option<PlayScene> {
     }
 }
 
+/// Freeze the active BSN document before the asynchronous build, without saving it.
+/// A blank tab or prefab leaves startup to the project's plugin.
+pub(crate) fn capture_legacy_scene(
+    world: &mut World,
+) -> Result<Option<tempfile::NamedTempFile>, String> {
+    let Some(scenes) = world.get_resource::<Scenes>() else {
+        return Ok(None);
+    };
+    let Some(tab) = scenes.tabs.get(scenes.active) else {
+        return Ok(None);
+    };
+    if tab.kind != TabKind::Scene
+        || (tab.path.is_none() && !crate::scenes::operators::active_tab_modified(world))
+    {
+        return Ok(None);
+    }
+    if tab.is_refused() {
+        return Err("Cannot play a scene the editor could not open".into());
+    }
+    let project = world.resource::<crate::project::ProjectRoot>();
+    let assets = project.assets_dir();
+    let dir = project.root.join(".jackdaw/pie-scenes");
+    let parent = tab
+        .path
+        .as_deref()
+        .and_then(Path::parent)
+        .unwrap_or(&assets)
+        .to_path_buf();
+    let base = parent
+        .strip_prefix(&assets)
+        .map_err(|_| "The selected scene is outside the project asset folder")?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let name = tab.display_name.clone();
+    if !world.contains_resource::<SceneBsnAst>() {
+        return Err("The selected scene document is unavailable".into());
+    }
+    let mut doc = crate::scene_io::save::live_document_for_game(world, &parent);
+    if !doc.absolute.is_empty() {
+        return Err(refusal(&doc.absolute));
+    }
+    jackdaw_bsn::migrate::write_bsn_scene_types(&mut doc.ast);
+    let text = jackdaw_bsn::emit_scene_checked(&doc.ast).map_err(|e| e.to_string())?;
+    let snapshot = serde_json::json!({"name": name, "asset_base": base, "bsn": text});
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut file = tempfile::Builder::new()
+        .prefix("scene-")
+        .suffix(".json")
+        .tempfile_in(dir)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_writer(file.as_file_mut(), &snapshot).map_err(|e| e.to_string())?;
+    Ok(Some(file))
+}
+
 /// What the game spawns for a root asking for the asset path `requested`, for an
 /// instance launched with `launch`. The document the path resolves to, if open in
 /// a tab or an edited prefab in the cache, answers with its text; anything else

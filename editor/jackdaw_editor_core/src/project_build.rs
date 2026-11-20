@@ -25,6 +25,9 @@ pub use jackdaw_project_build::{
     project_manifest, shim, shim_spec_for_project,
 };
 
+pub(crate) mod legacy_controls;
+use legacy_controls::Prompt;
+
 pub struct ProjectBuildPlugin;
 
 impl Plugin for ProjectBuildPlugin {
@@ -41,6 +44,7 @@ impl Plugin for ProjectBuildPlugin {
                     sync_project_build_settings,
                     watch_project_source_for_edit,
                     watch_project_schema,
+                    legacy_controls::sync,
                 )
                     .run_if(in_state(crate::AppState::Editor)),
             );
@@ -312,7 +316,8 @@ fn watch_project_source_for_edit(world: &mut World) {
 #[derive(Resource)]
 struct ProjectSchemaWatch {
     last_read: Option<(PathBuf, std::time::SystemTime)>,
-    legacy_attempt: Option<(PathBuf, String)>,
+    prompt: Option<(PathBuf, Prompt)>,
+    legacy_request: Option<(PathBuf, String)>,
     legacy_task: Option<Task<Result<(jackdaw_schema::ProjectSchema, String), String>>>,
     scan: jackdaw_project_build::legacy_schema::SourceScan,
     scan_task: Option<
@@ -330,7 +335,8 @@ impl Default for ProjectSchemaWatch {
     fn default() -> Self {
         Self {
             last_read: None,
-            legacy_attempt: None,
+            prompt: None,
+            legacy_request: None,
             legacy_task: None,
             scan: Default::default(),
             scan_task: None,
@@ -390,15 +396,7 @@ pub fn refresh_project_types(world: &mut World) -> Option<usize> {
     Some(component_count)
 }
 
-/// Import the old file immediately and discover the project's linked types off
-/// the UI thread. A worker returns data only; a closed project cannot publish
-/// over a newly opened one.
-fn refresh_legacy_schema(world: &mut World, root: &Path) {
-    let old_dir = root.join(".bsn_editor");
-    let old_path = jackdaw_schema::schema_path(&old_dir);
-    if !old_path.is_file() {
-        return;
-    }
+fn legacy_base(root: &Path) -> String {
     let stamp = |path: &Path| {
         std::fs::metadata(path)
             .ok()
@@ -406,78 +404,64 @@ fn refresh_legacy_schema(world: &mut World, root: &Path) {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_nanos())
     };
-    let base = format!(
-        "v2 {} {} {} {}",
-        stamp(&old_path),
+    format!(
+        "v3 {} {} {} {}",
+        stamp(&root.join(".bsn_editor/schema.json")),
         stamp(&root.join("Cargo.lock")),
         stamp(&root.join("Cargo.toml")),
         stamp(&root.join("bsn_editor.toml"))
-    );
+    )
+}
+
+/// Poll existing metadata and any job explicitly started by the user.
+fn refresh_legacy_schema(world: &mut World, root: &Path) {
+    let old_path = root.join(".bsn_editor/schema.json");
+    let base = legacy_base(root);
     let dest = root.join(".jackdaw");
     let primary = jackdaw_schema::schema_path(&dest);
     let marker = dest.join("legacy-schema.stamp");
     let unresolved = world
         .get_resource::<crate::inspector::unavailable::UnavailableTypes>()
         .is_some_and(|types| !types.0.is_empty());
-    // The first poll loads the legacy file for immediate use; examine its
-    // field descriptions once they are installed in ProjectTypes.
-    if !primary.exists()
-        && !unresolved
-        && !world
-            .get_resource::<ProjectSchemaWatch>()
-            .is_some_and(|watch| watch.legacy_task.is_some())
-    {
-        let seen = world
-            .get_resource::<ProjectSchemaWatch>()
-            .and_then(|w| w.last_read.as_ref());
-        if !seen.is_some_and(|(path, _)| path == &old_path) {
-            return;
-        }
+    let legacy_missing_fields = !primary.is_file() && old_path.is_file() && {
         let types = world.resource::<crate::project_types::ProjectTypes>();
         let registry = world.resource::<AppTypeRegistry>().read();
-        let missing = |field: &jackdaw_schema::FieldSchema| {
-            let path = crate::schema_values::item_type_path(field).unwrap_or(&field.type_path);
+        let missing = |f: &jackdaw_schema::FieldSchema| {
+            let path = crate::schema_values::item_type_path(f).unwrap_or(&f.type_path);
             registry.get_with_type_path(path).is_none() && types.type_schema(path).is_none()
         };
-        if !types.components().any(|ty| {
+        types.components().any(|ty| {
             ty.fields.iter().any(missing)
                 || ty.variants.iter().any(|v| v.fields.iter().any(missing))
-        }) {
-            return;
-        }
-    }
+        })
+    };
     let Some(mut watch) = world.get_resource_mut::<ProjectSchemaWatch>() else {
         return;
     };
-    if watch.legacy_task.is_none() {
+    if primary.is_file() && marker.is_file() && watch.legacy_task.is_none() {
         if let Some(task) = watch.scan_task.as_mut() {
             if let Some((scan, result)) = future::block_on(future::poll_once(task)) {
                 watch.scan_task = None;
                 watch.scan = scan;
-                watch.source_key = result
-                    .map_err(|err| warn!("Legacy schema source scan: {err}"))
-                    .ok();
+                watch.source_key = Some(result.unwrap_or_else(|_| "unverified".into()));
                 watch.next_scan = Instant::now() + Duration::from_secs(8);
             }
         } else if Instant::now() >= watch.next_scan {
             let root = root.to_owned();
             let mut scan = std::mem::take(&mut watch.scan);
             watch.scan_task = Some(IoTaskPool::get().spawn(async move {
-                let key = scan.fingerprint(&root);
+                let key = scan.metadata_stamp(&root);
                 (scan, key)
             }));
         }
     }
-    let Some(source_key) = watch.source_key.as_ref() else {
-        return;
-    };
-    let inputs = format!("{base} {source_key}");
     if let Some(task) = watch.legacy_task.as_mut() {
         let Some(result) = future::block_on(future::poll_once(task)) else {
             return;
         };
         watch.legacy_task = None;
-        if watch.legacy_attempt.as_ref() != Some(&(root.to_owned(), inputs.clone())) {
+        if watch.legacy_request.as_ref() != Some(&(root.to_owned(), base.clone())) {
+            watch.prompt = Some((root.to_owned(), Prompt::Stale));
             return;
         }
         let result = result.and_then(|(schema, source_key)| {
@@ -485,10 +469,11 @@ fn refresh_legacy_schema(world: &mut World, root: &Path) {
             jackdaw_project_build::legacy_schema::publish(&dest, &schema, &stamp)?;
             watch.source_key = Some(source_key);
             watch.scan_task = None;
-            watch.legacy_attempt = Some((root.to_owned(), stamp));
+            watch.prompt = None;
             Ok::<(), String>(())
         });
         if let Err(error) = result {
+            watch.prompt = Some((root.to_owned(), Prompt::Failed));
             error!("Legacy BSN schema: {error}");
             if let Some(mut build) = world.get_resource_mut::<BuildStatus>() {
                 build.state = crate::build_status::BuildState::Blocked {
@@ -500,23 +485,72 @@ fn refresh_legacy_schema(world: &mut World, root: &Path) {
         }
         return;
     }
-    if watch.legacy_attempt.as_ref() == Some(&(root.to_owned(), inputs.clone())) {
-        return;
-    }
-    if primary.is_file()
-        && std::fs::read_to_string(&marker).ok().as_deref() == Some(inputs.as_str())
-        && (!unresolved || !watch.last_read.as_ref().is_some_and(|(p, _)| p == &primary))
+    if watch
+        .prompt
+        .as_ref()
+        .is_some_and(|(owner, status)| owner == root && *status == Prompt::Failed)
     {
         return;
     }
-    watch.legacy_attempt = Some((root.to_owned(), inputs));
+    let reason =
+        if !primary.is_file() {
+            Some(if unresolved || legacy_missing_fields {
+                Prompt::Incomplete
+            } else if old_path.is_file() {
+                Prompt::LegacyOnly
+            } else {
+                Prompt::Missing
+            })
+        } else if watch.source_key.as_deref() == Some("unverified") {
+            Some(Prompt::Unverified)
+        } else if !marker.is_file() {
+            Some(Prompt::Stale)
+        } else if watch.source_key.as_ref().is_some_and(|key| {
+            std::fs::read_to_string(&marker).ok() != Some(format!("{base} {key}"))
+        }) {
+            Some(Prompt::Stale)
+        } else if unresolved {
+            Some(Prompt::Incomplete)
+        } else {
+            None
+        };
+    watch.prompt = reason.map(|state| (root.to_owned(), state));
+}
+
+/// A click authorizes exactly one attempt in the project that displayed the button.
+fn start_legacy_refresh(world: &mut World, root: &Path) {
+    if !world
+        .get_resource::<crate::project::ProjectRoot>()
+        .is_some_and(|project| project.root == root)
+        || !jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(root)
+    {
+        return;
+    }
+    let Some(mut watch) = world.get_resource_mut::<ProjectSchemaWatch>() else {
+        return;
+    };
+    if watch.legacy_task.is_some()
+        || !watch
+            .prompt
+            .as_ref()
+            .is_some_and(|(owner, status)| owner == root && status.actionable())
+    {
+        return;
+    }
+    watch.legacy_request = Some((root.to_owned(), legacy_base(root)));
+    watch.prompt = Some((root.to_owned(), Prompt::Running));
     let root = root.to_owned();
     watch.legacy_task = Some(IoTaskPool::get().spawn(async move {
-        let old = jackdaw_schema::read_schema(&old_dir)
-            .ok_or_else(|| format!("Cannot read {}", old_path.display()))?;
+        let path = root.join(".bsn_editor/schema.json");
+        let old = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|err| format!("{}: {err}", path.display()))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(err) => return Err(format!("{}: {err}", path.display())),
+        };
         jackdaw_project_build::legacy_schema::generate(&root, old)
     }));
-    info!("Preparing project type schema from legacy BSN metadata");
+    info!("User requested legacy BSN schema refresh");
 }
 
 fn watch_project_schema(world: &mut World) {

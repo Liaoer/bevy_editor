@@ -27,8 +27,11 @@ jackdaw_select.workspace = true
 jackdaw_uv.workspace = true
 jackdaw_widgets.workspace = true
 serde_json.workspace = true
+jackdaw_builder = { path = "../../integrations/builder" }
+jackdaw_camera_reference = { path = "../../integrations/camera_reference" }
 
 [dev-dependencies]
+tempfile = "3"
 # The features the root enables on the core, and not `default`, so the
 # modelling tests share the core `cargo build` and `cargo test` make instead
 # of compiling one of their own.
@@ -39,7 +42,6 @@ jackdaw_editor_core = { package = "jackdaw_editor_core", version = "0.21.0-dev",
 ] }
 jackdaw_runtime = { workspace = true, features = ["terrain", "tilemap"] }
 jackdaw_widgets.workspace = true
-tempfile = "3"
 
 [lints]
 workspace = true

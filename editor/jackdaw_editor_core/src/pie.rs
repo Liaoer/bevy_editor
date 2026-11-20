@@ -260,6 +260,8 @@ pub struct PieSession {
     pub(crate) launch_modes: HashMap<InstanceKey, PieWindowMode>,
     /// The scene an instance plays in place of its usual one, recorded at press.
     pub(crate) launch_scenes: HashMap<InstanceKey, LaunchScene>,
+    /// Immutable BSN input captured at Play, held until the pending or live instance ends.
+    legacy_snapshots: HashMap<InstanceKey, tempfile::NamedTempFile>,
     pub(crate) builds: HashMap<PathBuf, BuildState>,
     /// Scene answers being written on a worker.
     serving: Vec<ServingScene>,
@@ -1418,14 +1420,37 @@ pub(crate) fn launch_instance(world: &mut World, key: InstanceKey, run: RunConfi
         return;
     };
     crate::play_overlay::notice_unsaved_model_settings(world);
-    let scene = crate::play_scene::launch_scene(world, &run);
+    let legacy = jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root);
+    let scene = if legacy {
+        match crate::play_scene::capture_legacy_scene(world) {
+            Ok(Some(file)) => {
+                world
+                    .non_send_mut::<PieSession>()
+                    .legacy_snapshots
+                    .insert(key.clone(), file);
+            }
+            Ok(None) => {
+                world
+                    .non_send_mut::<PieSession>()
+                    .legacy_snapshots
+                    .remove(&key);
+            }
+            Err(reason) => {
+                crate::status_bar::notify_error(world, reason);
+                return;
+            }
+        }
+        None
+    } else {
+        crate::play_scene::launch_scene(world, &run)
+    };
 
     // If the game binary is built AND still current, spawn from it
     // immediately. A source edit since the last build invalidates the
     // cache so Play runs the new code: each Play is a fresh process, so
     // rebuilding is always safe.
     if let Some(BuildState::Done(path)) = world.non_send::<PieSession>().builds.get(&root) {
-        if source_is_current(&root, path) {
+        if !legacy && source_is_current(&root, path) {
             let path = path.clone();
             spawn_from_binary(world, key, &run, scene, &path);
             return;
@@ -1581,6 +1606,7 @@ pub(crate) fn spawn_game_build(
 ) -> (GameBuildTask, Arc<Mutex<BuildProgress>>) {
     let progress = Arc::new(Mutex::new(BuildProgress::default()));
     let sink = Arc::clone(&progress);
+    let root = root.to_owned();
     let jackdaw_dir = root.join(".jackdaw");
     let cancel = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::clone(&cancel);
@@ -1620,13 +1646,18 @@ pub(crate) fn spawn_game_build(
                 }
             }
         };
-        let result = crate::project_build::build_project_binary_cancellable(
-            &spec,
-            &jackdaw_dir,
-            load,
-            &cancelled,
-            &mut report,
-        );
+        let result =
+            if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+                jackdaw_project_build::build_legacy_play(&root, &spec, &cancelled, &mut report)
+            } else {
+                crate::project_build::build_project_binary_cancellable(
+                    &spec,
+                    &jackdaw_dir,
+                    load,
+                    &cancelled,
+                    &mut report,
+                )
+            };
         match result {
             Ok(build) => {
                 if let Ok(mut p) = sink.lock() {
@@ -2219,7 +2250,13 @@ fn poll_children(world: &mut World) {
     if let Some(mut names) = world.get_resource_mut::<crate::play_scene::PlayAssetNames>() {
         names.retain_games(|key| survivors.contains_key(key));
     }
-    world.non_send_mut::<PieSession>().children = survivors;
+    let mut session = world.non_send_mut::<PieSession>();
+    session.children = survivors;
+    if !session.legacy_snapshots.is_empty() {
+        let mut snapshots = std::mem::take(&mut session.legacy_snapshots);
+        snapshots.retain(|key, _| session.is_running(key) || session.is_pending(key));
+        session.legacy_snapshots = snapshots;
+    }
     for key in connected {
         greet_connected(world, &key);
     }
@@ -2461,6 +2498,12 @@ fn spawn_instance(
         .get_resource::<PieWindowMode>()
         .copied()
         .unwrap_or_default();
+    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+        command.env_remove("BSN_EDITOR_SCENE_SNAPSHOT");
+        if let Some(snapshot) = world.non_send::<PieSession>().legacy_snapshots.get(key) {
+            command.env("BSN_EDITOR_SCENE_SNAPSHOT", snapshot.path());
+        }
+    }
     if wants_windowless_env(mode) {
         command.env("JACKDAW_PIE_WINDOWLESS", "1");
     }

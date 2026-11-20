@@ -38,6 +38,8 @@ embed-recipe = ["jackdaw_editor_core/embed-recipe"]
 [workspace]
 members = [
     "crates/*",
+    "integrations/builder",
+    "integrations/camera_reference",
     "editor/*",
     "examples/extension/dynamic_extension",
     "examples/extension/viewable_camera_extension",

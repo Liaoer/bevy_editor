@@ -151,3 +151,6 @@ mod tests {
         );
     }
 }
+
+mod legacy_play;
+pub use legacy_play::build_legacy_play;

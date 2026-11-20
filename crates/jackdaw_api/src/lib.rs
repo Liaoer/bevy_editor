@@ -107,7 +107,7 @@ pub mod brush {
 /// runtime, and the file it lives in.
 pub mod document {
     pub use jackdaw_api_internal::document::{
-        SceneDocument, SceneFilePath, SceneMetadata, SceneOpened, SceneRenamed, SceneResource,
+        AuthoredComponents, AuthoredValue, SceneDocument, SceneFilePath, SceneMetadata, SceneOpened, SceneRenamed, SceneResource,
         SceneSaved, write_atomic,
     };
 }

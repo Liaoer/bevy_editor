@@ -6,6 +6,7 @@
 //!
 //! Add [`ModellingEditorPlugin`] after the editor's own plugins.
 
+
 pub mod brush_card;
 pub mod brush_element_ops;
 pub mod knife_mode;
@@ -37,6 +38,8 @@ pub struct ModellingEditorPlugin;
 
 impl Plugin for ModellingEditorPlugin {
     fn build(&self, app: &mut App) {
+        app.register_extension::<jackdaw_builder::BuilderPointsExtension>();
+        app.register_extension::<jackdaw_camera_reference::CameraReferenceExtension>();
         app.init_resource::<InsetModalState>()
             .init_resource::<LoopCutModalState>()
             .init_resource::<LoopCutPreviewLines>()

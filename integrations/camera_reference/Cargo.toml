@@ -1,0 +1,10 @@
+[package]
+name = "jackdaw_camera_reference"
+version.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bevy.workspace = true
+jackdaw_api.workspace = true
+serde_json.workspace = true
