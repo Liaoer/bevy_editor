@@ -1,3 +1,4 @@
+mod preview;
 use bevy::prelude::*;
 use jackdaw_api::document::{AuthoredValue, SceneDocument};
 use jackdaw_api::prelude::*;
@@ -14,7 +15,15 @@ impl JackdawExtension for CameraReferenceExtension {
     fn label(&self) -> String {
         "Cinemachine Rule Target".into()
     }
+    fn app_plugin(&self) -> Option<Box<dyn Plugin>> {
+        Some(Box::new(preview::install))
+    }
+    fn unregister(&self, world: &mut World, _: Entity) {
+        preview::close(world);
+    }
     fn register(&self, ctx: &mut ExtensionContext) {
+        ctx.register_operator::<preview::PickLensOp>()
+            .register_menu_entry::<preview::PickLensOp>(TopLevelMenu::Tools);
         ctx.register_operator::<AssignCameraOp>()
             .register_menu_entry::<AssignCameraOp>(TopLevelMenu::Tools);
     }
