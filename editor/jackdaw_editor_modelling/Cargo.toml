@@ -28,6 +28,7 @@ jackdaw_uv.workspace = true
 jackdaw_widgets.workspace = true
 serde_json.workspace = true
 jackdaw_builder = { path = "../../integrations/builder" }
+jackdaw_camera_reference = { path = "../../integrations/camera_reference" }
 
 [dev-dependencies]
 tempfile = "3"

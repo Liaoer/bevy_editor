@@ -4363,6 +4363,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jackdaw_camera_reference"
+version = "0.21.0-dev"
+dependencies = [
+ "bevy",
+ "jackdaw_api",
+ "serde_json",
+]
+
+[[package]]
 name = "jackdaw_camera_rig"
 version = "0.21.0-dev"
 dependencies = [
@@ -4546,6 +4555,7 @@ dependencies = [
  "jackdaw_api_internal",
  "jackdaw_bsn",
  "jackdaw_builder",
+ "jackdaw_camera_reference",
  "jackdaw_commands",
  "jackdaw_editor_core",
  "jackdaw_feathers",

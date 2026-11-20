@@ -39,6 +39,7 @@ pub struct ModellingEditorPlugin;
 impl Plugin for ModellingEditorPlugin {
     fn build(&self, app: &mut App) {
         app.register_extension::<jackdaw_builder::BuilderPointsExtension>();
+        app.register_extension::<jackdaw_camera_reference::CameraReferenceExtension>();
         app.init_resource::<InsetModalState>()
             .init_resource::<LoopCutModalState>()
             .init_resource::<LoopCutPreviewLines>()
