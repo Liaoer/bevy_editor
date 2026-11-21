@@ -45,8 +45,8 @@ pub use binary::{
 };
 pub use build::build_running;
 pub use build::{
-    BuildEvent, ProjectBuild, ProjectBuildError, build_project_dylib, last_built_dylib, sdk_remedy,
-    shim_spec_for_project,
+    BuildEvent, ProjectBuild, ProjectBuildError, build_project_dylib,
+    build_project_dylib_with_cache, last_built_dylib, sdk_remedy, shim_spec_for_project,
 };
 
 // The embedded SDK-builder recipe (relative path + bytes), assembled by

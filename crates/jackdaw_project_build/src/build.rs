@@ -23,7 +23,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -209,6 +209,21 @@ pub fn build_project_dylib(
     dev_workspace: Option<&Path>,
     report: &mut dyn FnMut(BuildEvent),
 ) -> Result<ProjectBuild, ProjectBuildError> {
+    build_project_dylib_with_cache(spec, jackdaw_dir, None, sdk, dev_workspace, report)
+}
+
+/// Build with an optional external cache for the generated shim, redirect plan,
+/// and Cargo outputs. The caller owns cache retention. Keep the supplied path
+/// spelling so a short Windows directory alias stays short for Cargo and MSVC.
+/// The project still records the verified artifact for `jd extension pack`.
+pub fn build_project_dylib_with_cache(
+    spec: &ShimSpec,
+    jackdaw_dir: &Path,
+    cache: Option<&Path>,
+    sdk: &SdkPaths,
+    dev_workspace: Option<&Path>,
+    report: &mut dyn FnMut(BuildEvent),
+) -> Result<ProjectBuild, ProjectBuildError> {
     // Checked before the shim is even written: an SDK with no library or
     // no wrapper fails the same way whatever the extension is, and it does
     // so minutes in. Reported through the log too, so the editor's build
@@ -252,7 +267,25 @@ pub fn build_project_dylib(
 
     let sdk_svh = linkage::sdk_svh(&sdk.dylib, sdk.toolchain.as_deref())
         .map_err(ProjectBuildError::Linkage)?;
-    let shim_dir = shim::ensure_shim(spec, jackdaw_dir, &sdk_svh)?;
+    let cache_dir = cache.map(|root| {
+        let mut hasher = DefaultHasher::new();
+        jackdaw_dir.hash(&mut hasher);
+        root.join(format!("{:016x}", hasher.finish()))
+    });
+    let build_dir = cache_dir.as_deref().unwrap_or(jackdaw_dir);
+    let _lock = if cache.is_some() {
+        std::fs::create_dir_all(build_dir)?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(build_dir.join("build.lock"))?;
+        lock.lock()?;
+        Some(lock)
+    } else {
+        None
+    };
+    let shim_dir = shim::ensure_shim(spec, build_dir, &sdk_svh)?;
 
     // Pin the shim's toolchain to the SDK's. The shim is outside the
     // user's workspace, so it would otherwise build with the ambient
@@ -337,18 +370,21 @@ pub fn build_project_dylib(
         }
     }
 
-    let plan_path = jackdaw_dir.join("plan.txt");
+    let plan_path = build_dir.join("plan.txt");
     let edges = plan::write_plan(&shim_dir, &manifest, &sdk.deps, &plan_path)?;
 
     // Key the target dir by everything cargo cannot fingerprint: the
     // plan and wrapper contents.
     let salt = build_salt(&plan_path, &sdk.wrapper)?;
-    let target_root = jackdaw_dir.join("target");
+    let target_root = build_dir.join("target");
     let target_dir = target_root.join(&salt);
-    retain_recent_target_dirs(&target_root, &salt, &crate::game_target_dir(jackdaw_dir));
+    if cache.is_none() {
+        retain_recent_target_dirs(&target_root, &salt, &crate::game_target_dir(jackdaw_dir));
+    }
 
     let mut cmd = sdk_toolchain_command("cargo");
     cmd.args(["rustc", "--crate-type", "cdylib", "--target", &sdk.triple])
+        .arg("--locked")
         // Machine-readable stream so the editor can show live per-crate
         // progress, with rustc's diagnostics in it.
         //
@@ -418,10 +454,12 @@ pub fn build_project_dylib(
     // The hash the editor matches against its own SDK made it into the
     // artifact.
     linkage::verify_linkage(&dylib, &sdk_svh).map_err(ProjectBuildError::Linkage)?;
-    std::fs::write(
-        jackdaw_dir.join(LAST_BUILD_RECORD),
-        dylib.to_string_lossy().as_bytes(),
-    )?;
+    std::fs::create_dir_all(jackdaw_dir)?;
+    let mut record = tempfile::NamedTempFile::new_in(jackdaw_dir)?;
+    record.write_all(dylib.to_string_lossy().as_bytes())?;
+    record
+        .persist(jackdaw_dir.join(LAST_BUILD_RECORD))
+        .map_err(|error| error.error)?;
 
     Ok(ProjectBuild { dylib, edges })
 }

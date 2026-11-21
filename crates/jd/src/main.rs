@@ -89,8 +89,8 @@ const SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "build",
         flags: &[],
-        values: &["--project", "-p"],
-        usage: "jd build [--project <path>]",
+        values: &["--project", "-p", "--extension-cache"],
+        usage: "jd build [--project <path>] [--extension-cache <absolute-dir>]",
     },
     CommandSpec {
         name: "run",
@@ -257,6 +257,7 @@ fn print_usage() {
          self update                Update jd to the newest stable release\n  \
          upgrade [path] [--apply]   Move a project to this Jackdaw's versions\n  \
          build [--project <path>]   Build project code for the editor\n  \
+           --extension-cache <dir>   Use an external build cache for an editor extension\n  \
          run [--project <path>]     Build and run the game\n  \
          setup                      Prepare the pinned SDK\n  \
          clean [--cargo]            Remove the project's .jackdaw/target build cache\n    \

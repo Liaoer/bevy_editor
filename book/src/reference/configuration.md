@@ -138,7 +138,7 @@ toolchain.
 - `jd open [path]`
 - `jd editor <list|install|remove|default|locate|clean>`
 - `jd self update`
-- `jd build [--project <path>]`
+- `jd build [--project <path>] [--extension-cache <absolute-dir>]`
 - `jd run [--project <path>]`
 - `jd setup`
 - `jd doctor`
@@ -146,6 +146,12 @@ toolchain.
 
 Import previews by default and performs no writes without `--apply`.
 Release-only `package-sdk` and `bundle` operations live under `cargo xtask`.
+
+For an editor extension, `--extension-cache` puts the generated shim, plan,
+and compiler output under the supplied directory. Use a short absolute path
+on Windows to keep MSVC's output paths short. Jackdaw creates a subdirectory
+per project and leaves cache retention to the caller. The project keeps the
+verified artifact path in `.jackdaw/last-extension-build` for `jd extension pack`.
 
 ## Where the SDK lives
 

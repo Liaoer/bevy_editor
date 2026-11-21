@@ -7,8 +7,8 @@
 //! Commands:
 //!
 //! ```text
-//! build [--project <path>]   Build the project so a running editor
-//!                            picks up new or changed components.
+//! build [--project <path>] [--extension-cache <absolute-dir>]
+//!                            Build the project for the editor.
 //! run   [--project <path>]   Build, then launch the game standalone.
 //! setup                      Build the SDK into the cache (one-time).
 //! doctor                     Report SDK build prerequisites.
@@ -25,7 +25,9 @@ use std::process::ExitCode;
 
 use jackdaw_project_build::bootstrap::{self, SetupProgress};
 use jackdaw_project_build::build_tools::CheckStatus;
-use jackdaw_project_build::{BuildEvent, build_project_binary, build_project_dylib, sdk_paths};
+use jackdaw_project_build::{
+    BuildEvent, build_project_binary, build_project_dylib_with_cache, sdk_paths,
+};
 use jackdaw_schema::{read_schema, schema_path};
 
 pub mod package;
@@ -524,20 +526,50 @@ fn removed_feature_problems(root: &Path, package_dir: &Path) -> Vec<Problem> {
         .collect()
 }
 
-/// `jd build [--project <path>]`: run the same pipeline the editor runs.
+/// `jd build`: run the same pipeline the editor runs.
 /// A game persists `.jackdaw/schema.json`, which a running editor watches
 /// and reloads; a project that is only an extension builds its library
 /// against the SDK for `jd extension pack`. Defaults to the current
 /// directory.
 fn cmd_build(args: &[String]) -> ExitCode {
-    let root = match resolve_root(args) {
+    let mut args = args.to_vec();
+    let cache = match take_extension_cache(&mut args) {
+        Ok(cache) => cache,
+        Err(message) => {
+            eprintln!("jd build: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let root = match resolve_root(&args) {
         Ok(root) => root,
         Err(code) => return code,
     };
-    match build_project(&root) {
+    match build_project(&root, cache.as_deref()) {
         Ok(_) => ExitCode::SUCCESS,
         Err(code) => code,
     }
+}
+
+fn take_extension_cache(args: &mut Vec<String>) -> Result<Option<PathBuf>, &'static str> {
+    let mut positions = args
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| *arg == "--extension-cache");
+    let Some((index, _)) = positions.next() else {
+        return Ok(None);
+    };
+    if positions.next().is_some() {
+        return Err("--extension-cache can only be specified once");
+    }
+    let Some(path) = args
+        .get(index + 1)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
+        return Err("--extension-cache needs an absolute directory");
+    };
+    args.drain(index..=index + 1);
+    Ok(Some(path))
 }
 
 /// `jd run [--project <path>]`: build the game (refreshing the schema a
@@ -548,7 +580,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         Ok(root) => root,
         Err(code) => return code,
     };
-    let binary = match build_project(&root) {
+    let binary = match build_project(&root, None) {
         Ok(Some(binary)) => binary,
         Ok(None) => {
             eprintln!(
@@ -590,7 +622,12 @@ fn resolve_root(args: &[String]) -> Result<PathBuf, ExitCode> {
 /// Build the project at `root`: a game as its own binary with its schema
 /// persisted, a project that is only an extension against the SDK. Returns
 /// the game's binary, or `None` for an extension.
-fn build_project(root: &Path) -> Result<Option<PathBuf>, ExitCode> {
+fn build_project(root: &Path, extension_cache: Option<&Path>) -> Result<Option<PathBuf>, ExitCode> {
+    let is_extension = bootstrap::project_needs_sdk(root);
+    if extension_cache.is_some() && !is_extension {
+        eprintln!("jd build: --extension-cache requires an editor extension project");
+        return Err(ExitCode::FAILURE);
+    }
     let spec = match jackdaw_project_build::shim_spec_for_project(root) {
         Ok(spec) => spec,
         Err(error) => {
@@ -600,8 +637,8 @@ fn build_project(root: &Path) -> Result<Option<PathBuf>, ExitCode> {
     };
 
     let jackdaw_dir = root.join(".jackdaw");
-    if bootstrap::project_needs_sdk(root) {
-        return match build_extension(root, &spec, &jackdaw_dir) {
+    if is_extension {
+        return match build_extension(root, &spec, &jackdaw_dir, extension_cache) {
             ExitCode::SUCCESS => Ok(None),
             code => Err(code),
         };
@@ -642,6 +679,7 @@ fn build_extension(
     root: &Path,
     spec: &jackdaw_project_build::shim::ShimSpec,
     jackdaw_dir: &Path,
+    cache: Option<&Path>,
 ) -> ExitCode {
     if bootstrap::needs_setup() {
         println!(
@@ -667,9 +705,10 @@ fn build_extension(
             eprintln!("{line}");
         }
     };
-    match build_project_dylib(
+    match build_project_dylib_with_cache(
         spec,
         jackdaw_dir,
+        cache,
         &sdk,
         dev_workspace.as_deref(),
         &mut report,
@@ -738,7 +777,28 @@ fn parse_project_arg(args: &[String]) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SdkGrade, grade_sdk, removed_feature_problems};
+    use super::{
+        SdkGrade, grade_sdk, parse_project_arg, removed_feature_problems, take_extension_cache,
+    };
+
+    #[test]
+    fn extension_cache_preserves_the_project_argument() {
+        let cache = std::env::temp_dir().join("cache with spaces");
+        let mut args = vec![
+            "--extension-cache".into(),
+            cache.to_string_lossy().into_owned(),
+            "--project".into(),
+            "extension".into(),
+        ];
+        assert_eq!(take_extension_cache(&mut args), Ok(Some(cache)));
+        assert_eq!(parse_project_arg(&args), Some("extension".into()));
+    }
+
+    #[test]
+    fn extension_cache_rejects_relative_paths() {
+        let mut args = vec!["--extension-cache".into(), "relative".into()];
+        assert!(take_extension_cache(&mut args).is_err());
+    }
 
     fn game_with_runtime(name: &str, features: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("jackdaw_cli_{name}_{}", std::process::id()));
