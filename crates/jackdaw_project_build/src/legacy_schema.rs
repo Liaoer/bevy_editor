@@ -159,7 +159,9 @@ pub(super) fn install(path: PathBuf, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn generate(root: &Path, old: ProjectSchema) -> Result<(ProjectSchema, String)> {
-    let settings = read_toml(&root.join("bsn_editor.toml"))?;
+    let settings = read_toml(&crate::project_manifest::ProjectManifest::manifest_path(
+        root,
+    ))?;
     let features: Vec<_> = settings
         .get("features")
         .and_then(Value::as_array)

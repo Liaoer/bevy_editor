@@ -136,9 +136,11 @@ rev = "{UPSTREAM_TEXT_FIX}"
 }
 
 fn prepare(root: &Path, spec: &ShimSpec, dir: &Path) -> Result<(), String> {
-    let settings: Settings = read_toml(&root.join("bsn_editor.toml"))?
-        .try_into()
-        .map_err(|e: toml::de::Error| e.to_string())?;
+    let settings: Settings = read_toml(&crate::project_manifest::ProjectManifest::manifest_path(
+        root,
+    ))?
+    .try_into()
+    .map_err(|e: toml::de::Error| e.to_string())?;
     if !matches!(
         settings.scene_source.as_deref(),
         None | Some("project" | "active")

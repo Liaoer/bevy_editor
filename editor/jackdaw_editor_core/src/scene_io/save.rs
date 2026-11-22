@@ -336,7 +336,7 @@ pub(crate) fn prepare_scene_save(world: &mut World) -> Result<PreparedSave, Bevy
     if world
         .get_resource::<crate::project::ProjectRoot>()
         .is_some_and(|project| {
-            jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(
+            jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_compatibility(
                 &project.root,
             )
         })

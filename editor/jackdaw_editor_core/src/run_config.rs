@@ -27,12 +27,7 @@ pub fn read_run_configs(world: &mut World) {
 }
 
 fn load_manifest(root: &Path) -> Manifest {
-    let path = if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(root)
-    {
-        root.join("bsn_editor.toml")
-    } else {
-        root.join("jackdaw.toml")
-    };
+    let path = jackdaw_project_build::project_manifest::ProjectManifest::manifest_path(root);
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_manifest_str(&text),
         Err(_) => synthesize_default(root),

@@ -60,6 +60,9 @@ pub struct ProjectManifest {
     /// projects, where resolution is unambiguous.
     #[serde(default)]
     pub package: Option<String>,
+    /// Keep BSN scene and Play compatibility when using a Jackdaw manifest.
+    #[serde(default)]
+    pub bsn_compatibility: bool,
     #[serde(default)]
     pub jackdaw: VersionPins,
     /// The asset folder, relative to the project root. Absent means
@@ -97,11 +100,7 @@ impl ProjectManifest {
     /// could not be parsed. A missing file is `Ok(default)`: not being
     /// set up is not an error.
     pub fn read_checked(root: &Path) -> Result<Self, String> {
-        let manifest = if Self::uses_bsn_manifest(root) {
-            root.join(BSN_FILE_NAME)
-        } else {
-            path(root)
-        };
+        let manifest = Self::manifest_path(root);
         match std::fs::read_to_string(&manifest) {
             Ok(text) => {
                 toml::from_str(&text).map_err(|error| format!("{}: {error}", manifest.display()))
@@ -116,6 +115,19 @@ impl ProjectManifest {
     /// project setup and SDK checks.
     pub fn uses_bsn_manifest(root: &Path) -> bool {
         !Self::exists(root) && root.join(BSN_FILE_NAME).is_file()
+    }
+
+    /// The project file used by both the ordinary and BSN-compatible readers.
+    pub fn manifest_path(root: &Path) -> PathBuf {
+        if Self::uses_bsn_manifest(root) {
+            root.join(BSN_FILE_NAME)
+        } else {
+            path(root)
+        }
+    }
+
+    pub fn uses_bsn_compatibility(root: &Path) -> bool {
+        Self::uses_bsn_manifest(root) || Self::read(root).bsn_compatibility
     }
 
     /// The asset folder relative to the project root. A configured path

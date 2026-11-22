@@ -1420,7 +1420,8 @@ pub(crate) fn launch_instance(world: &mut World, key: InstanceKey, run: RunConfi
         return;
     };
     crate::play_overlay::notice_unsaved_model_settings(world);
-    let legacy = jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root);
+    let legacy =
+        jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_compatibility(&root);
     let scene = if legacy {
         match crate::play_scene::capture_legacy_scene(world) {
             Ok(Some(file)) => {
@@ -1647,7 +1648,9 @@ pub(crate) fn spawn_game_build(
             }
         };
         let result =
-            if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+            if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_compatibility(
+                &root,
+            ) {
                 jackdaw_project_build::build_legacy_play(&root, &spec, &cancelled, &mut report)
             } else {
                 crate::project_build::build_project_binary_cancellable(
@@ -2498,7 +2501,7 @@ fn spawn_instance(
         .get_resource::<PieWindowMode>()
         .copied()
         .unwrap_or_default();
-    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_compatibility(&root) {
         command.env_remove("BSN_EDITOR_SCENE_SNAPSHOT");
         if let Some(snapshot) = world.non_send::<PieSession>().legacy_snapshots.get(key) {
             command.env("BSN_EDITOR_SCENE_SNAPSHOT", snapshot.path());

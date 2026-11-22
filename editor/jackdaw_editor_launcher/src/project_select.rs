@@ -446,7 +446,7 @@ pub fn enter_project_with(world: &mut World, root: PathBuf, skip_build: bool) {
         show_not_a_project_card(world, root, NotAProject::NoManifest);
         return;
     }
-    if project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+    if project_manifest::ProjectManifest::uses_bsn_compatibility(&root) {
         if let Err(error) = project_manifest::ProjectManifest::read_checked(&root) {
             warn!("Cannot open the BSN project: {error}");
             show_not_a_project_card(world, root, NotAProject::InvalidManifest(error));

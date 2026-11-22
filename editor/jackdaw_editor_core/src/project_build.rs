@@ -99,7 +99,7 @@ pub(crate) fn prebuild_play_target(world: &mut World) {
     };
     // A BSN manifest admits scene editing only. Do not run a Jackdaw SDK
     // build or load an existing extension when the project first opens.
-    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_compatibility(&root) {
         return;
     }
     // Loading an extension built in an earlier session compiles nothing, so
@@ -282,7 +282,7 @@ fn watch_project_source_for_edit(world: &mut World) {
     let Some(root) = project_root(world) else {
         return;
     };
-    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_compatibility(&root) {
         return;
     }
     if crate::extension_build::is_extension_project(world, &root, false) {
@@ -364,7 +364,9 @@ pub fn refresh_project_types(world: &mut World) -> Option<usize> {
         .get_resource::<crate::project::ProjectRoot>()
         .map(|p| p.root.clone())?;
     let mut jackdaw_dir = root.join(".jackdaw");
-    if jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root) {
+    let legacy =
+        jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_compatibility(&root);
+    if legacy {
         refresh_legacy_schema(world, &root);
         if !jackdaw_schema::schema_path(&jackdaw_dir).is_file() {
             jackdaw_dir = root.join(".bsn_editor");
@@ -383,8 +385,7 @@ pub fn refresh_project_types(world: &mut World) -> Option<usize> {
         crate::project_types::native_type_paths(&world.resource::<AppTypeRegistry>().read());
     let component_count = {
         let mut project_types = world.resource_mut::<crate::project_types::ProjectTypes>();
-        project_types.legacy_bsn =
-            jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(&root);
+        project_types.legacy_bsn = legacy;
         project_types.update(&schema, &native);
         project_types.components().count()
     };
@@ -409,7 +410,7 @@ fn legacy_base(root: &Path) -> String {
         stamp(&root.join(".bsn_editor/schema.json")),
         stamp(&root.join("Cargo.lock")),
         stamp(&root.join("Cargo.toml")),
-        stamp(&root.join("bsn_editor.toml"))
+        stamp(&jackdaw_project_build::project_manifest::ProjectManifest::manifest_path(root))
     )
 }
 
@@ -522,7 +523,7 @@ fn start_legacy_refresh(world: &mut World, root: &Path) {
     if !world
         .get_resource::<crate::project::ProjectRoot>()
         .is_some_and(|project| project.root == root)
-        || !jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_manifest(root)
+        || !jackdaw_project_build::project_manifest::ProjectManifest::uses_bsn_compatibility(root)
     {
         return;
     }
