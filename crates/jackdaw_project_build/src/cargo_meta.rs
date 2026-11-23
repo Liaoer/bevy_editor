@@ -38,11 +38,15 @@ struct MetaResolve {
 struct MetaNode {
     id: String,
     dependencies: Vec<String>,
+    #[serde(default)]
+    features: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct MetaPackage {
     name: String,
+    #[serde(default)]
+    version: String,
     /// Package id, matched against `workspace_members`. Optional so a
     /// hand-written metadata document (tests, fixtures) parses without
     /// it; `--no-deps` already limits packages to workspace members, so
@@ -428,6 +432,126 @@ pub fn resolve_project_package(
     let mut package = meta.resolve_package(preferred)?;
     package.dir = spelled_under(root, package.dir);
     Ok(package)
+}
+
+/// Verify the selected binary's own stable Bevy graph and native IPC runtime.
+pub(crate) fn check_native_pie_bevy_020(
+    root: &Path,
+    manifest: &crate::project_manifest::ProjectManifest,
+) -> Result<(), String> {
+    let selected = resolve_project_package(root, manifest.package.as_deref())
+        .map_err(|error| error.to_string())?;
+    if !selected.has_bin {
+        return Err("native PIE requires a game binary".into());
+    }
+
+    let mut command = user_toolchain_command("cargo");
+    command.current_dir(&selected.dir).args([
+        "metadata",
+        "--locked",
+        "--format-version",
+        "1",
+        "--filter-platform",
+        jackdaw_env::HOST_TRIPLE,
+    ]);
+    manifest.apply_native_pie_features(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("could not read the native PIE graph: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read the locked native PIE graph: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let meta = CargoMeta::parse(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|error| error.to_string())?;
+    let game = meta
+        .packages
+        .iter()
+        .find(|package| meta.is_member(package) && package.name == selected.name)
+        .ok_or("native PIE requires a game binary")?;
+    let resolve = meta
+        .resolve
+        .as_ref()
+        .ok_or("native PIE requires resolved Cargo metadata")?;
+    let node = |id: &str| resolve.nodes.iter().find(|node| node.id == id);
+    let package = |id: &str| meta.packages.iter().find(|package| package.id == id);
+    let dependency = |owner: &MetaPackage, name: &str| {
+        node(&owner.id)?
+            .dependencies
+            .iter()
+            .filter_map(|id| package(id))
+            .find(|pkg| pkg.name == name)
+    };
+
+    let runtime =
+        dependency(game, "jackdaw_runtime").ok_or("native PIE requires jackdaw_runtime")?;
+    let protocol = dependency(runtime, "jackdaw_pie_protocol")
+        .ok_or("native PIE requires jackdaw_runtime's pie feature")?;
+    if runtime.version != crate::VERSION || protocol.version != crate::VERSION {
+        return Err(format!(
+            "native PIE requires Jackdaw runtime and protocol {}",
+            crate::VERSION
+        ));
+    }
+    if runtime.source != protocol.source {
+        return Err("native PIE requires runtime and protocol from the same source".into());
+    }
+    for (owner, feature) in [(runtime, "pie"), (protocol, "ipc")] {
+        if !node(&owner.id)
+            .is_some_and(|node| node.features.iter().any(|enabled| enabled == feature))
+        {
+            return Err(format!("native PIE requires {}/{feature}", owner.name));
+        }
+    }
+    let bevy = dependency(game, "bevy").ok_or("native PIE requires the game's Bevy dependency")?;
+    if bevy.version != "0.20.0"
+        || ![runtime, protocol]
+            .into_iter()
+            .all(|owner| dependency(owner, "bevy").is_some_and(|other| other.id == bevy.id))
+    {
+        return Err(
+            "game, runtime and protocol must resolve to the same Bevy 0.20.0 package".into(),
+        );
+    }
+
+    let mut reachable = HashSet::new();
+    let mut pending = vec![game.id.as_str()];
+    while let Some(id) = pending.pop() {
+        if reachable.insert(id)
+            && let Some(node) = node(id)
+        {
+            pending.extend(node.dependencies.iter().map(String::as_str));
+        }
+    }
+    if meta
+        .packages
+        .iter()
+        .any(|pkg| pkg.name == "jackdaw_sdk" && reachable.contains(pkg.id.as_str()))
+    {
+        return Err("a separately built native PIE game cannot link the editor SDK".into());
+    }
+    for name in [
+        "bevy",
+        "bevy_app",
+        "bevy_ecs",
+        "bevy_asset",
+        "bevy_reflect",
+        "bevy_input",
+        "bevy_render",
+    ] {
+        let mut matches = meta
+            .packages
+            .iter()
+            .filter(|pkg| pkg.name == name && reachable.contains(pkg.id.as_str()));
+        if !matches.next().is_some_and(|pkg| pkg.version == "0.20.0") || matches.next().is_some() {
+            return Err(format!(
+                "native PIE requires exactly one Bevy 0.20.0 {name} in the game graph"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The crates holding the code of the project at `root`, whose game is

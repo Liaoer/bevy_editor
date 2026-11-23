@@ -1190,21 +1190,28 @@ fn keep_assets_named(ast: &mut SceneBsnAst, registry: &bevy::reflect::TypeRegist
     ast.roots.retain(|root| !unused.contains(root));
 }
 
-/// The index of the tab holding `target`, when it holds a scene or prefab that
-/// loaded.
+/// The index of a loaded tab holding `target`. If a file is open more than
+/// once, prefer its active tab so Play sees the document being edited.
 fn tab_of(world: &World, target: &PlayScene) -> Option<usize> {
     let scenes = world.get_resource::<Scenes>()?;
     let project = world.get_resource::<crate::project::ProjectRoot>()?;
-    scenes.tabs.iter().position(|tab| {
-        !tab.is_refused()
-            && match target {
-                PlayScene::Untitled(name) => tab.path.is_none() && tab.display_name == *name,
-                PlayScene::Path(path) => tab
-                    .path
-                    .as_deref()
-                    .is_some_and(|held| project.to_asset_path(held).as_deref() == Some(path)),
-            }
-    })
+    let prefer_active = matches!(target, PlayScene::Path(_));
+    scenes
+        .tabs
+        .iter()
+        .enumerate()
+        .filter(|(_, tab)| {
+            !tab.is_refused()
+                && match target {
+                    PlayScene::Untitled(name) => tab.path.is_none() && tab.display_name == *name,
+                    PlayScene::Path(path) => tab
+                        .path
+                        .as_deref()
+                        .is_some_and(|held| project.to_asset_path(held).as_deref() == Some(path)),
+                }
+        })
+        .min_by_key(|(index, _)| prefer_active && *index != scenes.active)
+        .map(|(index, _)| index)
 }
 
 /// Where the tab's document counts as being, on disk.

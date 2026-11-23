@@ -1,7 +1,7 @@
 //! Builds a project as its own cargo binary. The project is a normal Bevy
 //! app, so `cargo build` in the project root is the whole build.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,6 +92,24 @@ pub fn game_target_dir(jackdaw_dir: &Path) -> PathBuf {
     jackdaw_dir.join("target/game")
 }
 
+/// A managed launcher can explicitly hand its Cargo target to the game build.
+pub const USE_CARGO_GAME_TARGET: &str = "JACKDAW_GAME_USE_CARGO_TARGET_DIR";
+
+fn inherited_game_target() -> io::Result<Option<PathBuf>> {
+    if std::env::var(USE_CARGO_GAME_TARGET).as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .filter(|target| target.is_absolute() && target.is_dir())
+        .ok_or_else(|| {
+            io::Error::other(
+                "native game build needs an existing absolute CARGO_TARGET_DIR from its launcher",
+            )
+        })?;
+    Ok(Some(target))
+}
+
 /// Build a project's game binary and extract its type schema.
 ///
 /// `jackdaw_dir` is the project's `.jackdaw/`, where the schema is persisted for
@@ -135,23 +153,41 @@ pub fn build_project_binary_cancellable(
     report: &mut dyn FnMut(BuildEvent),
 ) -> Result<ProjectBinaryBuild, ProjectBuildError> {
     let target_dir = game_target_dir(jackdaw_dir);
+    let root = jackdaw_dir.parent().unwrap_or(&spec.project_root);
+    let manifest = crate::project_manifest::ProjectManifest::read_checked(root)
+        .map_err(io::Error::other)?;
+    let inherited_target = if manifest.native_pie {
+        let target = inherited_game_target()?.ok_or_else(|| {
+            io::Error::other("native PIE compatibility needs a managed Cargo target")
+        })?;
+        crate::project_manifest::check_native_pie_admission(root, &manifest)
+            .map_err(io::Error::other)?;
+        Some(target)
+    } else {
+        None
+    };
     report(BuildEvent::Log(format!(
         "building {} as a cargo binary in {}, into {}",
         spec.package_name,
         spec.project_root.display(),
-        target_dir.display()
+        inherited_target.as_deref().unwrap_or(&target_dir).display()
     )));
 
     // A build on Bevy's main branch hands the game its own Bevy commit; a
     // lockfile at another commit would build a game whose types are not
     // the editor's.
-    match crate::bevy_source::pin_project(&spec.project_root) {
-        Ok(Some(pinned)) => report(BuildEvent::Log(pinned)),
-        Ok(None) => {}
-        Err(error) => report(BuildEvent::Log(format!("warning: {error}"))),
+    if !manifest.native_pie {
+        match crate::bevy_source::pin_project(&spec.project_root) {
+            Ok(Some(pinned)) => report(BuildEvent::Log(pinned)),
+            Ok(None) => {}
+            Err(error) => report(BuildEvent::Log(format!("warning: {error}"))),
+        }
     }
 
-    let mut command = game_build_command(spec, &target_dir, load);
+    let mut command = game_build_command(spec, &target_dir, load, inherited_target.is_some());
+    if manifest.native_pie {
+        manifest.apply_native_pie_features(&mut command);
+    }
     let binary = compile_binary(
         &mut command,
         &spec.package_name,
@@ -349,9 +385,14 @@ fn read_toml(file: &Path) -> Option<toml::Value> {
 
 /// The `cargo build` that compiles the game, run by the project's own
 /// toolchain and detached from the editor's build environment.
-fn game_build_command(spec: &ShimSpec, target_dir: &Path, load: BuildLoad) -> Command {
+fn game_build_command(
+    spec: &ShimSpec,
+    target_dir: &Path,
+    load: BuildLoad,
+    inherit_target: bool,
+) -> Command {
     let profile = game_dependency_profile(&spec.project_root);
-    game_build_command_with(spec, target_dir, load, &profile)
+    game_build_command_with(spec, target_dir, load, &profile, inherit_target)
 }
 
 fn game_build_command_with(
@@ -359,13 +400,15 @@ fn game_build_command_with(
     target_dir: &Path,
     load: BuildLoad,
     profile: &[&str],
+    inherit_target: bool,
 ) -> Command {
     let mut command = user_toolchain_command("cargo");
-    command
-        .arg("build")
-        .args(["-p", &spec.package_name])
-        .arg("--target-dir")
-        .arg(target_dir);
+    command.arg("build").args(["-p", &spec.package_name]);
+    if !inherit_target {
+        command.arg("--target-dir").arg(target_dir);
+    } else {
+        command.arg("--locked");
+    }
     for setting in profile {
         command.arg("--config").arg(setting);
     }
@@ -380,7 +423,7 @@ fn game_build_command_with(
         // unresolvable dependency, are never in the JSON stream, and inherited
         // they reach only the terminal the editor was launched from.
         .stderr(Stdio::piped());
-    detach_from_host_build(&mut command);
+    detach_host_build_vars(&mut command, inherit_target);
     apply_load(&mut command, load);
     command
 }
@@ -599,13 +642,21 @@ const HOST_BUILD_PREFIXES: &[&str] = &["CARGO_PKG_", "CARGO_CFG_", "CARGO_FEATUR
 /// `CARGO_HOME`, `RUSTUP_HOME` and `PATH` are deliberately kept: they locate the
 /// toolchain and the shared package cache.
 pub fn detach_from_host_build(command: &mut Command) {
+    detach_host_build_vars(command, false);
+}
+
+fn detach_host_build_vars(command: &mut Command, inherit_target: bool) {
     for variable in HOST_BUILD_VARS {
-        command.env_remove(variable);
+        if !inherit_target || *variable != "CARGO_TARGET_DIR" {
+            command.env_remove(variable);
+        }
     }
     // The prefixed ones are per-crate and unbounded, so they have to be
     // discovered from this process's environment rather than listed.
     for (key, _) in std::env::vars_os() {
-        if is_host_build_var(&key.to_string_lossy()) {
+        if (!inherit_target || key != "CARGO_TARGET_DIR")
+            && is_host_build_var(&key.to_string_lossy())
+        {
             command.env_remove(&key);
         }
     }
@@ -783,7 +834,7 @@ mod tests {
             project_root: PathBuf::from("/game"),
             extension_type: None,
         };
-        let command = game_build_command(&spec, Path::new("/target"), BuildLoad::Foreground);
+        let command = game_build_command(&spec, Path::new("/target"), BuildLoad::Foreground, false);
         let toolchain: Vec<_> = command
             .get_envs()
             .filter(|(key, _)| *key == "RUSTUP_TOOLCHAIN")
@@ -818,10 +869,16 @@ mod tests {
             extension_type: None,
         };
         let profile = dependency_profile_for(project, None, NO_ENV);
-        game_build_command_with(&spec, Path::new("/target"), BuildLoad::Foreground, &profile)
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect()
+        game_build_command_with(
+            &spec,
+            Path::new("/target"),
+            BuildLoad::Foreground,
+            &profile,
+            false,
+        )
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
     }
 
     fn project_with_manifest(manifest: &str) -> tempfile::TempDir {

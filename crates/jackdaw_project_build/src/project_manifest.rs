@@ -63,6 +63,14 @@ pub struct ProjectManifest {
     /// Keep BSN scene and Play compatibility when using a Jackdaw manifest.
     #[serde(default)]
     pub bsn_compatibility: bool,
+    /// Opt in to verified separate-process PIE with stable Bevy 0.20.0.
+    #[serde(default)]
+    pub native_pie: bool,
+    /// Feature selection for the separate-process game, shared by admission and build.
+    #[serde(default)]
+    pub default_features: Option<bool>,
+    #[serde(default)]
+    pub features: Vec<String>,
     #[serde(default)]
     pub jackdaw: VersionPins,
     /// The asset folder, relative to the project root. Absent means
@@ -128,6 +136,15 @@ impl ProjectManifest {
 
     pub fn uses_bsn_compatibility(root: &Path) -> bool {
         Self::uses_bsn_manifest(root) || Self::read(root).bsn_compatibility
+    }
+
+    pub(crate) fn apply_native_pie_features(&self, command: &mut std::process::Command) {
+        if self.default_features == Some(false) {
+            command.arg("--no-default-features");
+        }
+        if !self.features.is_empty() {
+            command.arg("--features").arg(self.features.join(","));
+        }
     }
 
     /// The asset folder relative to the project root. A configured path
@@ -284,6 +301,26 @@ pub fn compare_project(root: &Path, manifest: &ProjectManifest) -> PinStatus {
         },
         _ => status,
     }
+}
+
+/// Check the supported stable-game/main-editor pairing without an SDK type boundary.
+pub fn check_native_pie_admission(root: &Path, manifest: &ProjectManifest) -> Result<(), String> {
+    if !manifest.native_pie
+        || manifest.bsn_compatibility
+        || ProjectManifest::uses_bsn_manifest(root)
+        || crate::BEVY_VERSION != "main"
+        || manifest
+            .jackdaw
+            .bevy
+            .as_deref()
+            .is_some_and(|pin| pin != "0.20")
+        || declared_bevy_minor(root).as_deref() != Some("0.20")
+    {
+        return Err(
+            "native PIE compatibility requires a Bevy 0.20 game and a Bevy main editor".into(),
+        );
+    }
+    crate::cargo_meta::check_native_pie_bevy_020(root, manifest)
 }
 
 /// The Bevy minor a project targets: its recorded pin, else the

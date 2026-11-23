@@ -447,7 +447,13 @@ pub fn enter_project_with(world: &mut World, root: PathBuf, skip_build: bool) {
         return;
     }
     if project_manifest::ProjectManifest::uses_bsn_compatibility(&root) {
-        if let Err(error) = project_manifest::ProjectManifest::read_checked(&root) {
+        let checked = project_manifest::ProjectManifest::read_checked(&root).and_then(|manifest| {
+            if manifest.native_pie {
+                return Err("native_pie cannot be combined with BSN compatibility".into());
+            }
+            Ok(())
+        });
+        if let Err(error) = checked {
             warn!("Cannot open the BSN project: {error}");
             show_not_a_project_card(world, root, NotAProject::InvalidManifest(error));
             return;
@@ -473,7 +479,14 @@ pub fn enter_project_with(world: &mut World, root: PathBuf, skip_build: bool) {
     // watches a doomed build.
     let manifest = project_manifest::ProjectManifest::read(&root);
     let pins = project_manifest::compare_project(&root, &manifest);
-    if pins.is_blocking() {
+    if manifest.native_pie {
+        if let Err(error) = project_manifest::check_native_pie_admission(&root, &manifest) {
+            warn!("Native PIE admission refused: {error}");
+            show_not_a_project_card(world, root, NotAProject::InvalidManifest(error));
+            return;
+        }
+        info!("Admitted Bevy 0.20 game for native PIE: {}", root.display());
+    } else if pins.is_blocking() {
         show_version_mismatch_card(world, root, pins);
         return;
     }
