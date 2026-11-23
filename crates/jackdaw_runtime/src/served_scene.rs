@@ -36,6 +36,7 @@ const SLOW_ANSWER: Duration = Duration::from_secs(15);
 pub(crate) struct SceneRequests {
     next: u64,
     open: HashMap<u64, OpenRequest>,
+    external: HashMap<u64, Option<SceneAnswer>>,
     /// Answers that arrived this update, taken by the roots waiting on them in
     /// the next spawn pass.
     answered: HashMap<u64, Received>,
@@ -290,12 +291,51 @@ fn ask(world: &mut World, path: &str) -> u64 {
     request
 }
 
+/// Ask the editor for a document consumed by the game's own scene loader.
+/// This does not spawn or register a Jackdaw scene root.
+pub fn request_scene_document(world: &mut World, path: &str) -> Option<u64> {
+    let request = {
+        let mut requests = world.get_resource_mut::<SceneRequests>()?;
+        let request = requests.next;
+        requests.next += 1;
+        requests.external.insert(request, None);
+        request
+    };
+    crate::pie::send_state(
+        world,
+        &StateEvent::RequestScene {
+            request,
+            path: path.to_string(),
+        },
+    );
+    Some(request)
+}
+
+/// Take the matching response without applying its document to the runtime world.
+pub fn take_scene_document(world: &mut World, request: u64) -> Option<SceneAnswer> {
+    world
+        .get_resource_mut::<SceneRequests>()?
+        .external
+        .get_mut(&request)?
+        .take()
+}
+
 /// Take the editor's answer to `request`. A document's assets load now, whether
 /// or not a root still waits on it: the editor counts them as given, so edits it
 /// sends from here on name them. The text is read once, for its assets and for
 /// the spawn.
 pub(crate) fn receive(world: &mut World, request: u64, answer: SceneAnswer) {
     if !world.contains_resource::<SceneRequests>() {
+        return;
+    }
+    if let Some(reply) = world
+        .resource_mut::<SceneRequests>()
+        .external
+        .get_mut(&request)
+    {
+        if reply.is_none() {
+            *reply = Some(answer);
+        }
         return;
     }
     let document = match &answer {

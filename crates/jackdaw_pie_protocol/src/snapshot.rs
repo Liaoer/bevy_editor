@@ -5,6 +5,7 @@ use bevy::{
     asset::ReflectHandle,
     ecs::{
         archetype::{Archetype, ArchetypeId},
+        entity::{EntityGeneration, EntityIndex},
         reflect::ReflectComponent,
         world::EntityRef,
     },
@@ -35,7 +36,14 @@ pub struct RemoteEntity {
 pub fn entity_bits(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number.as_u64(),
-        Value::String(text) => text.parse::<Entity>().ok().map(Entity::to_bits),
+        // Bevy 0.20.0 has the same entity display format but no Entity::from_str.
+        Value::String(text) if text == "PLACEHOLDER" => Some(Entity::PLACEHOLDER.to_bits()),
+        Value::String(text) => {
+            let (index, generation) = text.split_once('v')?;
+            let index = EntityIndex::from_raw_u32(index.parse().ok()?)?;
+            let generation = EntityGeneration::from_bits(generation.parse().ok()?);
+            Some(Entity::from_index_and_generation(index, generation).to_bits())
+        }
         Value::Array(fields) => fields.first().and_then(entity_bits),
         Value::Object(fields) => fields.values().next().and_then(entity_bits),
         _ => None,

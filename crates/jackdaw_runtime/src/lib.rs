@@ -98,7 +98,11 @@ mod pie_windowless;
 #[cfg(feature = "pie")]
 mod served_scene;
 #[cfg(feature = "pie")]
+pub use jackdaw_pie_protocol::SceneAnswer as PieSceneAnswer;
+#[cfg(feature = "pie")]
 pub use pie_windowless::{maybe_windowless, windowless_requested};
+#[cfg(feature = "pie")]
+pub use served_scene::{request_scene_document, take_scene_document};
 
 pub mod frame_work;
 #[cfg(feature = "render")]
