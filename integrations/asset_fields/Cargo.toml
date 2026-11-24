@@ -1,0 +1,12 @@
+[package]
+name = "jackdaw_asset_fields"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-features = false, features = ["bevy_ui"] }
+jackdaw_api = { path = "../../crates/jackdaw_api" }
+jackdaw_feathers = { path = "../../crates/jackdaw_feathers" }
