@@ -7,7 +7,8 @@
 //! on Escape or an outside click.
 
 use bevy::feathers::constants::size::CHECKBOX_SIZE;
-use bevy::picking::pointer::PointerButton;
+use bevy::picking::hover::HoverMap;
+use bevy::picking::pointer::{PointerButton, PointerId};
 use bevy::prelude::*;
 use bevy::ui::ui_transform::UiGlobalTransform;
 use bevy::ui_widgets::Activate;
@@ -90,6 +91,7 @@ fn on_menu_button_click(
         return;
     };
     let (_, _, pos) = global_tf.to_scale_angle_translation();
+    let pos = pos * computed.inverse_scale_factor();
     let size = computed.size() * computed.inverse_scale_factor();
     let right = pos.x + size.x / 2.0;
     let top = pos.y + size.y / 2.0 + 4.0;
@@ -409,9 +411,9 @@ fn close_menu_on_outside_click(
     mouse: Res<ButtonInput<MouseButton>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<PieMenuState>,
-    popovers: Query<&ComputedNode, With<PieMenuPopover>>,
-    popover_transforms: Query<&UiGlobalTransform, With<PieMenuPopover>>,
-    windows: Query<&Window>,
+    hovered: Res<HoverMap>,
+    parents: Query<&ChildOf>,
+    buttons: Query<(), With<PieMenuButton>>,
     focus: crate::keybind_focus::KeybindFocus,
     mut commands: Commands,
 ) {
@@ -432,22 +434,15 @@ fn close_menu_on_outside_click(
         return;
     }
 
-    let cursor = windows
-        .single()
-        .ok()
-        .and_then(bevy::prelude::Window::cursor_position);
-    if let (Some(cursor), Ok(computed), Ok(global_tf)) = (
-        cursor,
-        popovers.get(popover_entity),
-        popover_transforms.get(popover_entity),
-    ) {
-        let (_, _, pos) = global_tf.to_scale_angle_translation();
-        let size = computed.size() * computed.inverse_scale_factor();
-        let min = pos - size * 0.5;
-        let max = pos + size * 0.5;
-        if cursor.x >= min.x && cursor.x <= max.x && cursor.y >= min.y && cursor.y <= max.y {
-            return;
-        }
+    // Use the same hit targets as the buttons. A press inside must survive
+    // until release so the row can activate (or the caret can toggle).
+    if hovered.get(&PointerId::Mouse).is_some_and(|hits| {
+        hits.keys().any(|&hit| {
+            find_ancestor_with(hit, &parents, |e| e == popover_entity || buttons.contains(e))
+                .is_some()
+        })
+    }) {
+        return;
     }
 
     if let Ok(mut ec) = commands.get_entity(popover_entity) {
