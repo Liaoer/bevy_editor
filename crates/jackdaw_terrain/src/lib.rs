@@ -28,6 +28,7 @@ pub mod tint;
 pub use brush::{SculptTool, affected_chunks, affected_chunks_at, apply_brush, apply_brush_at};
 pub use channel::{
     ChannelData, ChannelDescriptor, ChannelElement, apply_channel_brush, apply_density_brush,
+    apply_density_brush_to,
 };
 pub use clipmap::{
     ClipmapLevel, GridSquare, REBUILD_BUDGET, SurfaceMeshData, build_clipmap_indices,

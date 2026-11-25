@@ -649,6 +649,7 @@ fn sync_surfaces(
                         terrain: terrain_entity,
                         level: level.level,
                     },
+                    jackdaw_terrain::render::TerrainDrawSurface(terrain_entity),
                     Transform::default(),
                     Visibility::default(),
                     ChildOf(terrain_entity),

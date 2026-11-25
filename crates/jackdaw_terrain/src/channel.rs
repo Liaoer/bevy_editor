@@ -190,6 +190,31 @@ pub fn apply_density_brush(
     dt: f32,
     erase: bool,
 ) -> usize {
+    let density = if erase { 0.0 } else { 1.0 };
+    apply_density_brush_to(
+        values, resolution, element, center, radius, hardness, falloff, opacity, dt, erase, density,
+    )
+}
+
+/// Add up to `density`, or erase down to it. Coverage already past the target
+/// in the direction of the stroke stays as it is. Density is normalized to 0–1.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors apply_density_brush with an explicit coverage target"
+)]
+pub fn apply_density_brush_to(
+    values: &mut [u16],
+    resolution: u32,
+    element: ChannelElement,
+    center: Vec2,
+    radius: f32,
+    hardness: f32,
+    falloff: f32,
+    opacity: f32,
+    dt: f32,
+    erase: bool,
+    density: f32,
+) -> usize {
     if resolution == 0
         || !radius.is_finite()
         || radius <= 0.0
@@ -197,10 +222,12 @@ pub fn apply_density_brush(
         || opacity <= 0.0
         || !dt.is_finite()
         || dt <= 0.0
+        || !density.is_finite()
     {
         return 0;
     }
-    let target = if erase { 0 } else { element.max_value() };
+    let ceiling = element.max_value();
+    let target = (density.clamp(0.0, 1.0) * f32::from(ceiling)).round() as u16;
     let res = resolution as i32;
 
     let min_x = ((center.x - radius).floor() as i32).clamp(0, res - 1);
@@ -220,12 +247,7 @@ pub fn apply_density_brush(
             let Some(before) = values.get(idx).copied() else {
                 continue;
             };
-            let before_within_ceiling = before.min(element.max_value());
-            let after = step_toward(
-                before_within_ceiling,
-                target,
-                (opacity * weight * dt).clamp(0.0, 1.0),
-            );
+            let after = density_cell(before, ceiling, target, erase, opacity * weight * dt);
             if after != values[idx] {
                 values[idx] = after;
                 changed += 1;
@@ -233,6 +255,171 @@ pub fn apply_density_brush(
         }
     }
     changed
+}
+
+/// Parameters of one update of a Detail stroke.
+pub struct DensityBrush {
+    pub radius: f32,
+    pub hardness: f32,
+    pub falloff: f32,
+    pub opacity: f32,
+    pub dt: f32,
+    pub erase: bool,
+    pub density: f32,
+}
+
+impl DensityBrush {
+    /// Paint the disc swept between two in-terrain samples. Each cell gets
+    /// one update per frame, so widely spaced samples cannot stack opacity.
+    pub fn sweep(
+        &self,
+        resolution: u32,
+        element: ChannelElement,
+        from: Vec2,
+        to: Vec2,
+        read: impl Fn(u32, u32) -> u16,
+    ) -> Option<(crate::GridRect, Vec<u16>)> {
+        let strength = self.opacity * self.dt;
+        if !strength.is_finite() || strength <= 0.0 || !self.density.is_finite() {
+            return None;
+        }
+        let ceiling = element.max_value();
+        let target = (self.density.clamp(0.0, 1.0) * f32::from(ceiling)).round() as u16;
+        self.sweep_values(resolution, from, to, read, |_, _, before, weight| {
+            density_cell(before, ceiling, target, self.erase, strength * weight)
+        })
+    }
+
+    /// Blend a stored height reduction or an inverse RGB565 tint along a
+    /// Detail stroke. The default zero value keeps full height and white tint.
+    pub fn sweep_appearance(
+        &self,
+        resolution: u32,
+        target: DetailAppearanceValue,
+        from: Vec2,
+        to: Vec2,
+        read: impl Fn(u32, u32) -> u16,
+    ) -> Option<(crate::GridRect, Vec<u16>)> {
+        let strength = self.opacity * self.dt;
+        if !strength.is_finite() || strength <= 0.0 {
+            return None;
+        }
+        self.sweep_values(resolution, from, to, read, |_, _, before, weight| {
+            let t = (strength * weight).clamp(0.0, 1.0);
+            match target {
+                DetailAppearanceValue::Height(percent) => {
+                    step_toward(before.min(255), u16::from(255 - percent), t)
+                }
+                DetailAppearanceValue::Color(rgb) => {
+                    let current = unpack_tint(before);
+                    let target = unpack_tint(encode_detail_tint(rgb));
+                    pack_tint(std::array::from_fn(|axis| {
+                        step_toward(current[axis], target[axis], t)
+                    }))
+                }
+            }
+        })
+    }
+
+    /// Place a categorical type along the stroke. A stable per-cell threshold
+    /// feathers the edge without creating intermediate type IDs.
+    pub fn sweep_species(
+        &self,
+        resolution: u32,
+        species: u8,
+        from: Vec2,
+        to: Vec2,
+        read: impl Fn(u32, u32) -> u16,
+    ) -> Option<(crate::GridRect, Vec<u16>)> {
+        if !self.opacity.is_finite() || self.opacity <= 0.0 {
+            return None;
+        }
+        self.sweep_values(resolution, from, to, read, |x, z, before, weight| {
+            let mut hash = x.wrapping_mul(0x9e37_79b9) ^ z.wrapping_mul(0x85eb_ca6b);
+            hash ^= hash >> 16;
+            hash = hash.wrapping_mul(0x7feb_352d);
+            hash ^= hash >> 15;
+            let threshold = (hash >> 8) as f32 / 16_777_216.0;
+            if threshold < self.opacity * weight {
+                u16::from(species)
+            } else {
+                before
+            }
+        })
+    }
+
+    fn sweep_values(
+        &self,
+        resolution: u32,
+        from: Vec2,
+        to: Vec2,
+        read: impl Fn(u32, u32) -> u16,
+        blend: impl Fn(u32, u32, u16, f32) -> u16,
+    ) -> Option<(crate::GridRect, Vec<u16>)> {
+        let rect = crate::GridRect::brush(resolution, from, self.radius)?
+            .union(crate::GridRect::brush(resolution, to, self.radius)?);
+        let segment = to - from;
+        let inverse = 1.0 / segment.length_squared().max(f32::EPSILON);
+        let mut values = Vec::with_capacity(rect.cells());
+        let mut changed = false;
+        for z in rect.z..rect.z + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                let offset = Vec2::new(x as f32, z as f32) - from;
+                let t = (offset.dot(segment) * inverse).clamp(0.0, 1.0);
+                let distance = (offset - t * segment).length();
+                let weight = brush_weight(distance, self.radius, self.falloff, self.hardness);
+                let before = read(x, z);
+                let after = if weight > 0.0 {
+                    blend(x, z, before, weight)
+                } else {
+                    before
+                };
+                changed |= before != after;
+                values.push(after);
+            }
+        }
+        changed.then_some((rect, values))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum DetailAppearanceValue {
+    /// Blade-length multiplier in the range 0–255.
+    Height(u8),
+    /// RGB multiplier encoded in sRGB.
+    Color([u8; 3]),
+}
+
+const RGB565_MAX: [u16; 3] = [31, 63, 31];
+
+fn unpack_tint(value: u16) -> [u16; 3] {
+    [(value >> 11) & 31, (value >> 5) & 63, value & 31]
+}
+
+fn pack_tint(rgb: [u16; 3]) -> u16 {
+    rgb[0] << 11 | rgb[1] << 5 | rgb[2]
+}
+
+pub fn encode_detail_tint(rgb: [u8; 3]) -> u16 {
+    pack_tint(std::array::from_fn(|axis| {
+        ((255 - u16::from(rgb[axis])) * RGB565_MAX[axis] + 127) / 255
+    }))
+}
+
+pub fn decode_detail_tint(value: u16) -> [u8; 3] {
+    let rgb = unpack_tint(value);
+    std::array::from_fn(|axis| {
+        (255 - (rgb[axis] * 255 + RGB565_MAX[axis] / 2) / RGB565_MAX[axis]) as u8
+    })
+}
+
+fn density_cell(before: u16, ceiling: u16, target: u16, erase: bool, strength: f32) -> u16 {
+    let value = before.min(ceiling);
+    if (erase && value < target) || (!erase && value > target) {
+        before
+    } else {
+        step_toward(value, target, strength.clamp(0.0, 1.0))
+    }
 }
 
 /// One cell eased `t` of the way from `from` to `to`, never passing it, and
@@ -261,6 +448,38 @@ fn step_toward(from: u16, to: u16, t: f32) -> u16 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn grass_appearance_keeps_neutral_zero_and_blends_color_components_independently() {
+        assert_eq!(encode_detail_tint([255; 3]), 0);
+        assert_eq!(decode_detail_tint(0), [255; 3]);
+        assert_eq!(
+            decode_detail_tint(encode_detail_tint([255, 0, 0])),
+            [255, 0, 0]
+        );
+        let brush = DensityBrush {
+            radius: 2.0,
+            hardness: 1.0,
+            falloff: 2.0,
+            opacity: 1.0,
+            dt: 0.5,
+            erase: false,
+            density: 1.0,
+        };
+        let at = Vec2::splat(3.0);
+        let (rect, patch) = brush
+            .sweep_appearance(
+                8,
+                DetailAppearanceValue::Color([255, 0, 0]),
+                at,
+                at,
+                |_, _| 0,
+            )
+            .unwrap();
+        let center = ((3 - rect.z) * rect.width + 3 - rect.x) as usize;
+        let [r, g, b] = decode_detail_tint(patch[center]);
+        assert_eq!(r, 255);
+        assert!((120..=135).contains(&g) && (120..=135).contains(&b));
+    }
     /// Every read of a mismatched channel is 0, including the ones whose
     /// index lands inside the stored values: at the caller's stride those
     /// name a different cell.
@@ -518,6 +737,90 @@ mod tests {
         assert!(
             values[20 * 40 + 20 + beyond_the_plateau] < centre,
             "the ring beyond the plateau has not fallen off"
+        );
+    }
+
+    #[test]
+    fn density_targets_add_or_remove_only_in_the_brush_direction() {
+        for element in [ChannelElement::U8, ChannelElement::U16] {
+            let full = element.max_value();
+            let target = (0.4 * f32::from(full)).round() as u16;
+            let mut cells = [0, full, 0, full];
+            for erase in [false, true] {
+                let changed = apply_density_brush_to(
+                    &mut cells,
+                    2,
+                    element,
+                    Vec2::ZERO,
+                    4.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    erase,
+                    0.4,
+                );
+                assert_eq!(changed, 2);
+                assert_eq!(
+                    cells,
+                    if erase {
+                        [target; 4]
+                    } else {
+                        [target, full, target, full]
+                    }
+                );
+            }
+            assert_eq!(
+                apply_density_brush_to(
+                    &mut cells,
+                    2,
+                    element,
+                    Vec2::ZERO,
+                    4.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    false,
+                    0.4,
+                ),
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn density_sweep_joined_distant_samples_without_repainting_outside() {
+        let brush = DensityBrush {
+            radius: 2.0,
+            hardness: 0.5,
+            falloff: 2.0,
+            opacity: 1.0,
+            dt: 1.0,
+            erase: true,
+            density: 0.2,
+        };
+        let (rect, patch) = brush
+            .sweep(
+                32,
+                ChannelElement::U8,
+                Vec2::new(3.0, 12.0),
+                Vec2::new(25.0, 12.0),
+                |_, _| u8::MAX.into(),
+            )
+            .expect("sweep changes coverage");
+        let mut values = vec![255; 32 * 32];
+        rect.write(&mut values, 32, &patch);
+        assert!(
+            values[12 * 32 + 3..=12 * 32 + 25]
+                .iter()
+                .all(|&value| value == 51)
+        );
+        assert!(values[9 * 32..10 * 32].iter().all(|&value| value == 255));
+        assert!(
+            brush
+                .sweep(32, ChannelElement::U8, Vec2::ZERO, Vec2::X, |_, _| 51)
+                .is_none()
         );
     }
 

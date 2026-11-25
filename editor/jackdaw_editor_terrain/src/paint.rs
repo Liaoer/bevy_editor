@@ -20,10 +20,11 @@
 //! the layer's identity and so its eraser.
 //!
 //! [`PaintDomain::Detail`] is the coverage channel one detail layer grows from.
-//! The brush eases cells toward its ceiling; Ctrl or Erase walks them to zero.
+//! The brush adds up to its paint target. Ctrl or Erase thins toward its erase target.
 
 use bevy::prelude::*;
 use jackdaw_api::prelude::*;
+use jackdaw_terrain::channel::{DensityBrush, DetailAppearanceValue};
 use jackdaw_terrain::render::DetailDirty;
 use jackdaw_terrain::{Control, GridRect};
 
@@ -62,6 +63,59 @@ pub enum PaintDomain {
     Textures,
     Color,
     Detail,
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetailPaintMap {
+    #[default]
+    Density,
+    Height,
+    Color,
+    Species,
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetailPreviewLod {
+    #[default]
+    Auto,
+    Near,
+    Middle,
+    Far,
+}
+
+impl DetailPaintMap {
+    pub(crate) const ALL: [Self; 4] = [Self::Density, Self::Height, Self::Color, Self::Species];
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Density => "density",
+            Self::Height => "height",
+            Self::Color => "color",
+            Self::Species => "species",
+        }
+    }
+
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|map| map.id() == name)
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Density => "Density",
+            Self::Height => "Grass Height",
+            Self::Color => "Grass Color",
+            Self::Species => "Grass Species",
+        }
+    }
+
+    pub fn channel(self, layer: &jackdaw_scene_types::DetailLayer) -> Option<&str> {
+        match self {
+            Self::Density => Some(&layer.density_channel),
+            Self::Height => layer.height_channel.as_deref(),
+            Self::Color => layer.color_channel.as_deref(),
+            Self::Species => layer.type_channel.as_deref(),
+        }
+    }
 }
 
 /// Which channel/value or texture/opacity the paint brush writes, and
@@ -116,18 +170,28 @@ pub struct TerrainPaintState {
     pub variation_amount: f32,
     /// Which detail layer the brush paints and the panel edits.
     pub detail_layer: usize,
+    pub detail_map: DetailPaintMap,
+    pub detail_height_percent: f32,
+    pub detail_color: [u8; 3],
+    pub detail_species_slot: u8,
+    /// Names projected from the grass asset used by the selected layer.
+    pub detail_species_palette: Option<(String, Vec<String>)>,
     /// How far a cell crosses toward full detail cover per second at full brush
     /// strength, `0.0..=1.0`, scaled by falloff and frame `dt`.
     pub detail_opacity: f32,
+    /// Maximum coverage the brush adds to, as a percentage.
+    pub detail_paint_percent: f32,
+    /// Coverage the eraser leaves behind, as a percentage.
+    pub detail_erase_percent: f32,
+    /// Show the selected detail layer's coverage on the terrain surface.
+    pub detail_overlay: Option<DetailPaintMap>,
+    pub detail_preview_lod: DetailPreviewLod,
+    /// Supplied by the GPU Grass Preview integration.
+    pub detail_gpu_preview_active: bool,
     /// Whether the detail brush thins cells out rather than thickening them.
     /// Ctrl does the same for one stroke.
     pub detail_erase: bool,
-    /// The ground a detail stroke has covered so far, marked for a reseed when
-    /// the stroke is released or abandoned.
-    pub stroke_detail_rect: Option<GridRect>,
-    /// The disc the previous frame of that stroke wrote, which the next
-    /// frame's mark is widened by.
-    pub detail_disc: Option<GridRect>,
+    detail_stroke: Option<DetailStroke>,
     /// Whether the brush hands cells back to autoterrain instead of
     /// painting a texture into them. The paint bar's Restore Auto
     /// checkbox switches this.
@@ -163,10 +227,19 @@ impl Default for TerrainPaintState {
             variation_frequency: 0.01,
             variation_amount: 0.15,
             detail_layer: 0,
+            detail_map: DetailPaintMap::Density,
+            detail_height_percent: 35.0,
+            detail_color: [216, 151, 74],
+            detail_species_slot: 0,
+            detail_species_palette: None,
             detail_opacity: 0.5,
+            detail_paint_percent: 100.0,
+            detail_erase_percent: 0.0,
+            detail_overlay: None,
+            detail_preview_lod: DetailPreviewLod::Auto,
+            detail_gpu_preview_active: false,
             detail_erase: false,
-            stroke_detail_rect: None,
-            detail_disc: None,
+            detail_stroke: None,
             restore_auto: false,
             stroke_restores: false,
         }
@@ -254,6 +327,103 @@ impl EditorCommand for SetTerrainChannel {
 
     fn heap_bytes(&self) -> usize {
         (self.old_values.capacity() + self.new_values.capacity()) * size_of::<u16>()
+    }
+}
+
+struct DetailStroke {
+    entity: Entity,
+    path: String,
+    channel: String,
+    map: DetailPaintMap,
+    resolution: u32,
+    before: Vec<u16>,
+    previous_hit: Option<Vec2>,
+    touched: Option<GridRect>,
+}
+
+struct SetDetailChannel {
+    entity: Entity,
+    channel: String,
+    map: DetailPaintMap,
+    resolution: u32,
+    rect: GridRect,
+    old: Vec<u16>,
+    new: Vec<u16>,
+}
+
+impl SetDetailChannel {
+    fn apply(&self, world: &mut World, values: &[u16]) {
+        let Some(entity) = super::live_terrain(world, self.entity) else {
+            return;
+        };
+        let Some(path) = world
+            .get::<jackdaw_scene_types::Terrain>(entity)
+            .map(|terrain| terrain.data_path.clone())
+        else {
+            return;
+        };
+        let mut store = world.resource_mut::<TerrainDataStore>();
+        let Some(channel) = density_channel(&store, &path, &self.channel, self.resolution) else {
+            return;
+        };
+        if store
+            .write_density_rect(&path, channel, self.rect, values, false)
+            .is_some()
+        {
+            if self.map == DetailPaintMap::Density {
+                super::detail::mark_detail_dirty(world, entity, self.rect);
+            }
+            if let Some(mut dirty) = world.get_mut::<TerrainDirtyChunks>(entity) {
+                mark_density_chunks(&mut dirty, self.rect);
+            }
+        }
+    }
+}
+
+impl EditorCommand for SetDetailChannel {
+    fn execute(&mut self, world: &mut World) {
+        self.apply(world, &self.new);
+    }
+
+    fn undo(&mut self, world: &mut World) {
+        self.apply(world, &self.old);
+    }
+
+    fn description(&self) -> &str {
+        match self.map {
+            DetailPaintMap::Density => "Paint Detail",
+            DetailPaintMap::Height => "Paint Grass Height",
+            DetailPaintMap::Color => "Paint Grass Color",
+            DetailPaintMap::Species => "Paint Grass Species",
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        (self.old.capacity() + self.new.capacity()) * size_of::<u16>() + self.channel.capacity()
+    }
+}
+
+fn density_channel(
+    store: &TerrainDataStore,
+    path: &str,
+    name: &str,
+    resolution: u32,
+) -> Option<usize> {
+    let document = store.get(path)?;
+    if store.is_load_failed(path) || document.grid_resolution() != resolution {
+        return None;
+    }
+    document
+        .channels
+        .iter()
+        .position(|channel| channel.name == name)
+}
+
+fn mark_density_chunks(dirty: &mut TerrainDirtyChunks, rect: GridRect) {
+    for z in rect.z / CHUNK_SIZE..=(rect.z + rect.height - 1) / CHUNK_SIZE {
+        for x in rect.x / CHUNK_SIZE..=(rect.x + rect.width - 1) / CHUNK_SIZE {
+            dirty.dirty.insert((x, z));
+        }
     }
 }
 
@@ -590,6 +760,16 @@ fn paint_invoke_trigger(
         return;
     }
     commands.queue(|world: &mut World| {
+        let paint = world.resource::<TerrainPaintState>();
+        if paint.domain == PaintDomain::Detail
+            && paint.detail_map != DetailPaintMap::Density
+            && let Some(entity) = paint.target
+        {
+            let (layer, map) = (paint.detail_layer, paint.detail_map);
+            if !super::detail_ops::prepare_appearance_channel(world, entity, layer, map) {
+                return;
+            }
+        }
         let _ = world
             .operator(TerrainPaintOp::ID)
             .settings(CallOperatorSettings {
@@ -626,12 +806,21 @@ pub fn terrain_paint(
     time: Res<Time>,
     active: ActiveModalQuery,
 ) -> Option<OperatorResult> {
-    if *edit_mode != TerrainEditMode::Paint {
+    if *edit_mode != TerrainEditMode::Paint && paint_state.detail_stroke.is_none() {
         return None;
     }
-    let target = paint_state.target?;
+    let target = paint_state
+        .detail_stroke
+        .as_ref()
+        .map(|stroke| stroke.entity)
+        .or(paint_state.target)?;
+    let domain = if paint_state.detail_stroke.is_some() {
+        PaintDomain::Detail
+    } else {
+        paint_state.domain
+    };
 
-    match paint_state.domain {
+    match domain {
         PaintDomain::Channels => {
             let (terrain, mut dirty, _) = terrain_query.get_mut(target).ok()?;
             let terrain = terrain.clone();
@@ -844,82 +1033,147 @@ pub fn terrain_paint(
             Some(OperatorResult::Running)
         }
         PaintDomain::Detail => {
-            let (terrain, _dirty, detail_dirty) = terrain_query.get_mut(target).ok()?;
-            let terrain = terrain.clone();
-            let index = super::detail::selected_detail_layer(&terrain, paint_state.detail_layer)?;
-            let layer = terrain.detail[index].clone();
-            let erase = paint_state.detail_erase
-                || keyboard.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
-
-            let mut data = store.entry_for(&terrain)?;
-            let channel_index = data
-                .channels()
-                .iter()
-                .position(|channel| channel.name == layer.density_channel)?;
-            let element = data.channel_mut(channel_index)?.element;
-            let resolution = data.document().grid_resolution();
-            let mut values = data.channel_values(channel_index);
-
-            if !active.is_modal_running() {
+            if paint_state.detail_stroke.is_none() {
+                let (terrain, _, _) = terrain_query.get(target).ok()?;
+                let index =
+                    super::detail::selected_detail_layer(terrain, paint_state.detail_layer)?;
+                let map = paint_state.detail_map;
+                let name = map.channel(&terrain.detail[index])?;
+                let document = store.get(&terrain.data_path)?;
+                let resolution = document.grid_resolution();
+                let channel = density_channel(&store, &terrain.data_path, name, resolution)?;
                 paint_state.active = true;
-                paint_state.stroke_channel = channel_index;
-                paint_state.stroke_snapshot = values.clone();
-                paint_state.stroke_detail_rect = None;
-                paint_state.detail_disc = None;
-            }
-
-            if super::stroke_should_end(&mouse) {
-                paint_state.active = false;
-                paint_state.detail_disc = None;
-                if let Some(rect) = paint_state.stroke_detail_rect.take()
-                    && let Some(mut detail_dirty) = detail_dirty
-                {
-                    detail_dirty.touch(rect);
-                }
-                let old_values = std::mem::take(&mut paint_state.stroke_snapshot);
-                if old_values != values {
-                    history.push_executed(Box::new(SetTerrainChannel {
-                        entity: target,
-                        channel: channel_index,
-                        old_values,
-                        new_values: values.clone(),
-                        label: "Paint Detail".to_string(),
-                    }));
-                }
-                return Some(OperatorResult::Finished);
-            }
-
-            if let Some(grid_pos) = paint_state.brush_position
-                && let Some(rect) = GridRect::brush(resolution, grid_pos, brush_settings.radius)
-            {
-                let changed = jackdaw_terrain::apply_density_brush(
-                    &mut values,
+                paint_state.detail_stroke = Some(DetailStroke {
+                    entity: target,
+                    path: terrain.data_path.clone(),
+                    channel: name.to_string(),
+                    map,
                     resolution,
-                    element,
-                    grid_pos,
-                    brush_settings.radius,
-                    DETAIL_HARDNESS,
-                    brush_settings.falloff,
-                    paint_state.detail_opacity,
-                    time.delta_secs(),
-                    erase,
-                );
-                if changed > 0 {
-                    data.set_channel_values(channel_index, &values);
-                    paint_state.stroke_detail_rect = Some(match paint_state.stroke_detail_rect {
-                        Some(grown) => grown.union(rect),
-                        None => rect,
-                    });
-                    let this_disc_and_the_last = match paint_state.detail_disc.replace(rect) {
-                        Some(last) => last.union(rect),
-                        None => rect,
+                    before: document.regions.read_grid_channel(channel, resolution),
+                    previous_hit: None,
+                    touched: None,
+                });
+            }
+            let mut stroke = paint_state.detail_stroke.take()?;
+            let same_target = paint_state.target == Some(stroke.entity)
+                && *edit_mode == TerrainEditMode::Paint
+                && paint_state.domain == PaintDomain::Detail
+                && paint_state.detail_map == stroke.map;
+            let surface = terrain_query
+                .get_mut(stroke.entity)
+                .ok()
+                .filter(|(terrain, _, _)| terrain.data_path == stroke.path);
+            let ending = super::stroke_should_end(&mouse) || !same_target || surface.is_none();
+            let channel = density_channel(&store, &stroke.path, &stroke.channel, stroke.resolution);
+            if let (Some(position), Some((_, mut dirty, detail_dirty)), Some(channel)) = (
+                paint_state.brush_position.filter(|_| same_target),
+                surface,
+                channel,
+            ) {
+                let previous = stroke.previous_hit.replace(position);
+                if !ending || previous != Some(position) {
+                    let erase = paint_state.detail_erase
+                        || keyboard.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+                    let density_percent = if erase {
+                        paint_state.detail_erase_percent
+                    } else {
+                        paint_state.detail_paint_percent
                     };
-                    if let Some(mut detail_dirty) = detail_dirty {
-                        detail_dirty.touch(this_disc_and_the_last);
+                    let brush = DensityBrush {
+                        radius: brush_settings.radius,
+                        hardness: DETAIL_HARDNESS,
+                        falloff: brush_settings.falloff,
+                        opacity: paint_state.detail_opacity,
+                        dt: time.delta_secs(),
+                        erase,
+                        density: density_percent / 100.0,
+                    };
+                    let patch = store.get(&stroke.path).and_then(|document| {
+                        let read = |x, z| document.regions.channel_at(channel, x as i32, z as i32);
+                        let from = previous.unwrap_or(position);
+                        let target = match stroke.map {
+                            DetailPaintMap::Density => {
+                                return brush.sweep(
+                                    stroke.resolution,
+                                    document.channels[channel].element,
+                                    from,
+                                    position,
+                                    read,
+                                );
+                            }
+                            DetailPaintMap::Species => {
+                                let slot = if erase {
+                                    0
+                                } else {
+                                    paint_state.detail_species_slot
+                                };
+                                return brush.sweep_species(
+                                    stroke.resolution,
+                                    slot,
+                                    from,
+                                    position,
+                                    read,
+                                );
+                            }
+                            DetailPaintMap::Height => DetailAppearanceValue::Height(if erase {
+                                255
+                            } else {
+                                (paint_state.detail_height_percent * 2.55).round() as u8
+                            }),
+                            DetailPaintMap::Color => DetailAppearanceValue::Color(if erase {
+                                [255; 3]
+                            } else {
+                                paint_state.detail_color
+                            }),
+                        };
+                        brush.sweep_appearance(stroke.resolution, target, from, position, read)
+                    });
+                    if let Some((rect, values)) = patch
+                        && let Some(allocated) =
+                            store.write_density_rect(&stroke.path, channel, rect, &values, true)
+                    {
+                        stroke.touched = Some(stroke.touched.map_or(rect, |old| old.union(rect)));
+                        if stroke.map == DetailPaintMap::Density
+                            && let Some(mut detail_dirty) = detail_dirty
+                        {
+                            detail_dirty.touch(rect);
+                        }
+                        if allocated || paint_state.detail_overlay == Some(stroke.map) {
+                            mark_density_chunks(&mut dirty, rect);
+                        }
+                    }
+                }
+            } else {
+                // A frame over UI or out of the terrain breaks the sweep.
+                stroke.previous_hit = None;
+            }
+
+            if !ending && channel.is_some() {
+                paint_state.detail_stroke = Some(stroke);
+                return Some(OperatorResult::Running);
+            }
+            paint_state.active = false;
+            if stroke.touched.is_some() {
+                store.finish_density_stroke(&stroke.path);
+            }
+            if let (Some(rect), Some(channel)) = (stroke.touched, channel) {
+                if let Some(document) = store.get(&stroke.path) {
+                    let old = rect.read(&stroke.before, stroke.resolution);
+                    let new = document.regions.channel_rect(channel, rect);
+                    if old != new {
+                        history.push_executed(Box::new(SetDetailChannel {
+                            entity: stroke.entity,
+                            channel: stroke.channel,
+                            map: stroke.map,
+                            resolution: stroke.resolution,
+                            rect,
+                            old,
+                            new,
+                        }));
                     }
                 }
             }
-            Some(OperatorResult::Running)
+            Some(OperatorResult::Finished)
         }
     }
 }
@@ -944,13 +1198,30 @@ fn cancel_terrain_paint(
         return;
     }
     paint_state.active = false;
-    paint_state.detail_disc = None;
-
-    if let Some(rect) = paint_state.stroke_detail_rect.take()
-        && let Some(target) = paint_state.target
-        && let Ok(mut dirty) = detail_dirty.get_mut(target)
-    {
-        dirty.touch(rect);
+    if let Some(stroke) = paint_state.detail_stroke.take() {
+        let Some(rect) = stroke.touched else {
+            return;
+        };
+        store.finish_density_stroke(&stroke.path);
+        if let Ok((terrain, mut dirty)) = terrain_query.get_mut(stroke.entity)
+            && terrain.data_path == stroke.path
+            && let Some(channel) =
+                density_channel(&store, &stroke.path, &stroke.channel, stroke.resolution)
+        {
+            let values = rect.read(&stroke.before, stroke.resolution);
+            if store
+                .write_density_rect(&stroke.path, channel, rect, &values, false)
+                .is_some()
+            {
+                mark_density_chunks(&mut dirty, rect);
+                if stroke.map == DetailPaintMap::Density
+                    && let Ok(mut dirty) = detail_dirty.get_mut(stroke.entity)
+                {
+                    dirty.touch(rect);
+                }
+            }
+        }
+        return;
     }
 
     if paint_state.domain == PaintDomain::Color {

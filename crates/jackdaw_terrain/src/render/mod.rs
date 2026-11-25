@@ -24,6 +24,8 @@ use bevy::shader::ShaderRef;
 use path_slash::PathExt as _;
 
 pub mod detail;
+mod horizon;
+pub use horizon::{TerrainDrawSurface, TerrainGrassHorizon};
 pub mod scatter;
 pub mod texels;
 
@@ -963,6 +965,14 @@ pub struct TerrainSplatMaterial {
     /// without one takes [`Self::perceptual_roughness`].
     #[uniform(0)]
     pub roughness_slots: u32,
+    #[uniform(0)]
+    horizon_params: Vec4,
+    #[texture(11)]
+    horizon_color: Option<Handle<Image>>,
+    #[texture(12)]
+    horizon_density: Option<Handle<Image>>,
+    #[texture(13)]
+    horizon_length: Option<Handle<Image>>,
     #[texture(1, dimension = "2d_array")]
     #[sampler(2)]
     pub albedo: Handle<Image>,
@@ -1046,6 +1056,10 @@ impl TerrainSplatMaterial {
             tint_strength: crate::sidecar::DEFAULT_TINT_STRENGTH,
             occlusion_slots: slot_mask(set, |entry| entry.occlusion.is_some()),
             roughness_slots: slot_mask(set, |entry| entry.roughness.is_some()),
+            horizon_params: Vec4::ZERO,
+            horizon_color: None,
+            horizon_density: None,
+            horizon_length: None,
             albedo: arrays.albedo,
             normal: arrays.normal,
             height: arrays.height,
@@ -1058,6 +1072,20 @@ impl TerrainSplatMaterial {
         material.set_autoterrain(autoterrain);
         material.set_surface(surface);
         material
+    }
+
+    pub(super) fn has_grass_horizon(&self, horizon: Option<&TerrainGrassHorizon>) -> bool {
+        self.horizon_params == horizon.map_or(Vec4::ZERO, TerrainGrassHorizon::params)
+            && self.horizon_color.as_ref() == horizon.map(|data| &data.color)
+            && self.horizon_density.as_ref() == horizon.map(|data| &data.density)
+            && self.horizon_length.as_ref() == horizon.and_then(|data| data.length.as_ref())
+    }
+
+    pub(super) fn set_grass_horizon(&mut self, horizon: Option<&TerrainGrassHorizon>) {
+        self.horizon_params = horizon.map_or(Vec4::ZERO, TerrainGrassHorizon::params);
+        self.horizon_color = horizon.map(|data| data.color.clone());
+        self.horizon_density = horizon.map(|data| data.density.clone());
+        self.horizon_length = horizon.and_then(|data| data.length.clone());
     }
 
     /// Point the autoterrain half of the uniform at `settings`.
@@ -1119,6 +1147,7 @@ pub struct TerrainRenderPlugin;
 impl Plugin for TerrainRenderPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/terrain_splat.wesl");
+        horizon::install(app);
         app.add_plugins(MaterialPlugin::<TerrainSplatMaterial>::default())
             .init_resource::<LayerTexels>()
             .add_systems(PreUpdate, texels::follow_layer_reads);

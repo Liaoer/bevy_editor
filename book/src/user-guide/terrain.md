@@ -59,6 +59,18 @@ generated names and colors; project-specific descriptor
 names, integer widths, labels, values, and colors can also be
 authored directly in the scene document.
 
+## Paint grass and other details
+
+Add and select a layer in the Terrain panel's **Detail** tab, then choose
+**Detail** in the Paint tool's target picker. Drag in the viewport to add
+coverage up to **Paint to %**. Hold `Ctrl` or turn on **Erase** to thin the
+layer down to **Erase to %**. **Opacity** sets the speed of each stroke, and
+**Falloff** controls the edge. Press `Ctrl+Z` to undo the whole stroke.
+
+**Show Density Mask** displays the selected layer on the terrain surface.
+Dark areas have no coverage, and brighter areas have more coverage. Turn it
+off to return to the regular terrain material.
+
 ## Quantization
 
 Enable quantization when the game needs a fixed metric grid or

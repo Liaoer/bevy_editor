@@ -732,6 +732,7 @@ fn apply(
         steps.push(Box::new(AddTerrainChannel {
             entity,
             name,
+            element: jackdaw_scene_types::TerrainChannelElement::U8,
             palette: super::channel_ops::seeded_palette(),
         }));
     }

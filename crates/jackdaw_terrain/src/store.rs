@@ -22,7 +22,7 @@ use crate::sidecar::{
 };
 use crate::texture_set::MAX_TEXTURES;
 use crate::{Control, GridRect, GridShape};
-use bevy::platform::collections::HashMap;
+use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
 
 /// Why a change to a terrain's material list was refused.
@@ -144,6 +144,11 @@ pub struct TerrainDataStore {
     /// path listed here may still hold what its file does; see
     /// [`Self::has_unsaved_edits`].
     edits: HashMap<String, u64>,
+    /// Paths with uncommitted density strokes. They must be treated as dirty
+    /// while painting without encoding the sidecar on every preview frame.
+    live_density: HashSet<String>,
+    /// Last rectangular density edit, for a projection at its exact predecessor.
+    density_edits: HashMap<String, DensityEdit>,
     /// A digest of the bytes each path's file held when it was last read or
     /// written, from [`sidecar_digest`].
     held: HashMap<String, u64>,
@@ -153,6 +158,14 @@ pub struct TerrainDataStore {
     /// Whether each path's document differed from [`Self::held`] as of an
     /// edit revision, behind a lock so asking takes `&self`.
     differs: Mutex<HashMap<String, (u64, bool)>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct DensityEdit {
+    pub before: Option<u64>,
+    pub revision: u64,
+    pub channel: usize,
+    pub rect: GridRect,
 }
 
 static NEXT_EDIT: AtomicU64 = AtomicU64::new(1);
@@ -172,11 +185,10 @@ fn document_digest(data: &RegionTerrainData) -> Option<u64> {
         .map(|bytes| sidecar_digest(&bytes))
 }
 
-fn note_edit(edits: &mut HashMap<String, u64>, data_path: &str) {
-    edits.insert(
-        data_path.to_string(),
-        NEXT_EDIT.fetch_add(1, Ordering::Relaxed),
-    );
+fn note_edit(edits: &mut HashMap<String, u64>, data_path: &str) -> u64 {
+    let revision = NEXT_EDIT.fetch_add(1, Ordering::Relaxed);
+    edits.insert(data_path.to_string(), revision);
+    revision
 }
 
 /// A terrain's heights ready to sample, with the height range a raycast needs
@@ -576,6 +588,8 @@ impl TerrainDataStore {
     /// Counts as an edit until [`Self::note_read`] says the file holds it.
     pub fn insert(&mut self, data_path: impl Into<String>, data: RegionTerrainData) {
         let data_path = data_path.into();
+        self.live_density.remove(&data_path);
+        self.density_edits.remove(&data_path);
         note_edit(&mut self.edits, &data_path);
         self.retire_heightmap(&data_path);
         self.load_failed.remove(&data_path);
@@ -604,6 +618,8 @@ impl TerrainDataStore {
 
     /// Drops a sidecar path's data.
     pub fn remove(&mut self, data_path: &str) -> Option<RegionTerrainData> {
+        self.live_density.remove(data_path);
+        self.density_edits.remove(data_path);
         self.cached().remove(data_path);
         self.read_mtimes.remove(data_path);
         self.edits.remove(data_path);
@@ -622,6 +638,9 @@ impl TerrainDataStore {
     /// time it is asked after each edit, so a file in an older format reads as
     /// edited once touched.
     pub fn has_unsaved_edits(&self, data_path: &str) -> bool {
+        if self.live_density.contains(data_path) {
+            return true;
+        }
         let Some(revision) = self.edits.get(data_path).copied() else {
             return false;
         };
@@ -666,6 +685,8 @@ impl TerrainDataStore {
     /// Record that `data_path` was just read from, or written to, a file last
     /// modified at `mtime`, which so holds what the store does.
     pub fn note_read(&mut self, data_path: &str, mtime: Option<std::time::SystemTime>) {
+        self.live_density.remove(data_path);
+        self.density_edits.remove(data_path);
         self.edits.remove(data_path);
         self.held.remove(data_path);
         self.read_files.remove(data_path);
@@ -733,10 +754,14 @@ impl TerrainDataStore {
         digest: u64,
     ) {
         let edits = self.edits.get(data_path).copied();
+        let live = self.live_density.contains(data_path);
         self.note_read(data_path, mtime);
         self.note_held(data_path, file, digest);
         if let Some(edit) = edits.filter(|edit| Some(*edit) != revision) {
             self.edits.insert(data_path.to_string(), edit);
+            if live {
+                self.live_density.insert(data_path.to_string());
+            }
         }
     }
 
@@ -809,6 +834,71 @@ impl TerrainDataStore {
         let data = self.entries.get_mut(data_path)?;
         note_edit(&mut self.edits, data_path);
         Some(data)
+    }
+
+    pub fn density_edit(&self, data_path: &str) -> Option<DensityEdit> {
+        let edit = *self.density_edits.get(data_path)?;
+        (self.edit_revision(data_path) == Some(edit.revision)).then_some(edit)
+    }
+
+    /// Apply a row-major density patch. Returns whether it allocated ground.
+    pub fn write_density_rect(
+        &mut self,
+        data_path: &str,
+        channel: usize,
+        rect: GridRect,
+        values: &[u16],
+        live: bool,
+    ) -> Option<bool> {
+        if self.load_failed.contains_key(data_path)
+            || rect.is_empty()
+            || values.len() != rect.cells()
+        {
+            return None;
+        }
+        let data = self.entries.get_mut(data_path)?;
+        let resolution = data.grid_resolution();
+        if channel >= data.channels.len()
+            || rect.x.saturating_add(rect.width) > resolution
+            || rect.z.saturating_add(rect.height) > resolution
+        {
+            return None;
+        }
+        let regions = data.regions.region_count();
+        for (row, values) in values.chunks_exact(rect.width as usize).enumerate() {
+            let z = rect.z + row as u32;
+            for (col, &value) in values.iter().enumerate() {
+                data.regions
+                    .set_channel(channel, (rect.x + col as u32) as i32, z as i32, value);
+            }
+        }
+        let allocated = regions != data.regions.region_count();
+        let before = self.edit_revision(data_path);
+        let revision = note_edit(&mut self.edits, data_path);
+        if live {
+            self.live_density.insert(data_path.to_string());
+        }
+        if allocated {
+            self.retire_heightmap(data_path);
+            self.density_edits.remove(data_path);
+        } else {
+            self.density_edits.insert(
+                data_path.to_string(),
+                DensityEdit {
+                    before,
+                    revision,
+                    channel,
+                    rect,
+                },
+            );
+        }
+        Some(allocated)
+    }
+
+    pub fn finish_density_stroke(&mut self, data_path: &str) {
+        if self.live_density.remove(data_path) {
+            self.forget_differs(data_path);
+        }
     }
 
     /// Every (sidecar path, document) pair currently held.
@@ -1684,6 +1774,57 @@ mod tests {
     ///
     /// A real document uses [`RegionSize::DEFAULT`], which would make every
     /// fixture here a quarter of a million cells.
+    #[test]
+    fn live_density_edits_keep_the_height_snapshot_and_check_exact_content_on_finish() {
+        let path = "density.jdterrain";
+        let terrain = jackdaw_scene_types::Terrain {
+            data_path: path.into(),
+            ..default()
+        };
+        let data = RegionTerrainData::from_legacy_v1(&crate::TerrainData {
+            resolution: 4,
+            heights: vec![0.0; 16],
+            channels: vec![crate::ChannelData::new(
+                "grass",
+                crate::ChannelElement::U8,
+                4,
+            )],
+        })
+        .unwrap();
+        let held = sidecar_digest(&sidecar::save(&data).unwrap());
+        let mut store = TerrainDataStore::default();
+        store.insert(path, data);
+        store.note_read(path, None);
+        store.note_held(path, path.into(), held);
+        let heightmap = store.heightmap(&terrain).map;
+        let rect = GridRect {
+            x: 1,
+            z: 2,
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(
+            store.write_density_rect(path, 0, rect, &[102], true),
+            Some(false)
+        );
+        let edit = store.density_edit(path).unwrap();
+        assert_eq!(edit.before, None);
+        assert_eq!(edit.rect, rect);
+        assert!(Arc::ptr_eq(&heightmap, &store.heightmap(&terrain).map));
+        assert!(store.has_unsaved_edits(path));
+        assert_eq!(
+            store.write_density_rect(path, 0, rect, &[0], true),
+            Some(false)
+        );
+        assert_eq!(
+            store.density_edit(path).unwrap().before,
+            Some(edit.revision)
+        );
+        assert!(store.has_unsaved_edits(path));
+        store.finish_density_stroke(path);
+        assert!(!store.has_unsaved_edits(path));
+    }
+
     #[test]
     fn an_edit_counts_until_the_file_holds_it() {
         let terrain = jackdaw_scene_types::Terrain {

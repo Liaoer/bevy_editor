@@ -53,7 +53,7 @@ pub(crate) fn live_terrain(world: &World, entity: Entity) -> Option<Entity> {
         .is_some()
         .then_some(entity)
 }
-pub use paint::{PaintDomain, TerrainPaintState};
+pub use paint::{DetailPaintMap, DetailPreviewLod, PaintDomain, TerrainPaintState};
 pub use palette::TerrainPalette;
 pub use regions::{RegionVisibility, TerrainRegionView};
 pub use store::TerrainDataStore;

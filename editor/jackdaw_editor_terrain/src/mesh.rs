@@ -3,8 +3,13 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use jackdaw_terrain::ClipmapLevel;
 
+use super::paint::{DetailPaintMap, PaintDomain};
 use super::regions::{TerrainRegionView, region_of};
-use super::{CHUNK_SIZE, TerrainDataStore, TerrainDirtyChunks, TerrainPaintState, TerrainSurface};
+use super::{
+    CHUNK_SIZE, TerrainDataStore, TerrainDirtyChunks, TerrainEditMode, TerrainPaintState,
+    TerrainSurface,
+};
+use jackdaw_editor_core::selection::Selection;
 use jackdaw_editor_core::viewport::{ActiveViewport, MainViewportCamera};
 
 pub(super) fn plugin(app: &mut App) {
@@ -46,7 +51,10 @@ fn retire_orphaned_surfaces(
 /// A terrain with a texture set draws with the splat material instead (see
 /// [`super::splat`]).
 #[derive(Resource)]
-struct TerrainMaterialHandle(Handle<StandardMaterial>);
+struct TerrainMaterialHandles {
+    fallback: Handle<StandardMaterial>,
+    detail_mask: Handle<StandardMaterial>,
+}
 
 /// Vertex colour for unpainted ground and for every vertex when the
 /// channel view is off.
@@ -60,27 +68,77 @@ const UNPAINTED: [f32; 4] = [0.5, 0.5, 0.5, 1.0];
 #[derive(Component)]
 struct BuiltLevel(ClipmapLevel);
 
-/// Rebuild every terrain when the visualised channel changes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DetailMask {
+    map: DetailPaintMap,
+    channel: Option<(usize, u16)>,
+}
+
+fn detail_mask_target(
+    paint: &TerrainPaintState,
+    mode: &TerrainEditMode,
+    selection: &Selection,
+) -> Option<(Entity, usize, DetailPaintMap)> {
+    if *mode != TerrainEditMode::Paint || paint.domain != PaintDomain::Detail {
+        return None;
+    }
+    Some((
+        selection.primary()?,
+        paint.detail_layer,
+        paint.detail_overlay?,
+    ))
+}
+
+fn detail_mask_binding(
+    terrain: &jackdaw_scene_types::Terrain,
+    document: &jackdaw_terrain::RegionTerrainData,
+    selected_layer: usize,
+    map: DetailPaintMap,
+) -> Option<DetailMask> {
+    let layer = super::detail::selected_detail_layer(terrain, selected_layer)?;
+    let channel = map.channel(&terrain.detail[layer]).and_then(|name| {
+        let (channel, descriptor) = document
+            .channels
+            .iter()
+            .enumerate()
+            .find(|(_, descriptor)| descriptor.name == name)?;
+        Some((channel, descriptor.element.max_value()))
+    });
+    Some(DetailMask { map, channel })
+}
+
+/// Rebuild the affected surfaces when the visible mask changes.
 ///
 /// [`TerrainPaintState`] also carries brush position, which changes almost
 /// every frame, so a bare `is_changed()` here would rebuild continuously;
-/// only the two relevant fields are compared.
+/// compare the two view keys instead.
 fn rebuild_on_channel_view_change(
     paint: Res<TerrainPaintState>,
-    mut last: Local<Option<(usize, bool)>>,
-    mut terrains: Query<&mut TerrainDirtyChunks, With<jackdaw_scene_types::Terrain>>,
+    mode: Res<TerrainEditMode>,
+    selection: Res<Selection>,
+    store: Res<TerrainDataStore>,
+    mut last_channel: Local<Option<(usize, bool)>>,
+    mut last_detail: Local<Option<(Entity, DetailMask)>>,
+    mut terrains: Query<(&jackdaw_scene_types::Terrain, &mut TerrainDirtyChunks)>,
 ) {
-    let current = (paint.active_channel, paint.show_channel);
-    if *last == Some(current) {
-        return;
-    }
-    let first_run = last.is_none();
-    *last = Some(current);
-    if first_run {
-        return;
-    }
-    for mut dirty in &mut terrains {
-        dirty.rebuild_all = true;
+    let channel = (paint.active_channel, paint.show_channel);
+    let detail = detail_mask_target(&paint, &mode, &selection).and_then(|(entity, layer, map)| {
+        let (terrain, _) = terrains.get(entity).ok()?;
+        let document = store.get(&terrain.data_path)?;
+        Some((entity, detail_mask_binding(terrain, document, layer, map)?))
+    });
+    let previous_channel = last_channel.replace(channel);
+    let previous_detail = std::mem::replace(&mut *last_detail, detail);
+    if previous_channel.is_some_and(|previous| previous != channel) {
+        for (_, mut dirty) in &mut terrains {
+            dirty.rebuild_all = true;
+        }
+    } else if previous_detail != detail {
+        for (entity, _) in [previous_detail, detail].into_iter().flatten() {
+            if let Ok((_, mut dirty)) = terrains.get_mut(entity) {
+                dirty.rebuild_all = true;
+            }
+        }
     }
 }
 
@@ -137,9 +195,11 @@ fn sync_terrain_surface(
     transforms: Query<&GlobalTransform>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    material_res: Option<Res<TerrainMaterialHandle>>,
+    material_res: Option<Res<TerrainMaterialHandles>>,
     store: Res<TerrainDataStore>,
     paint: Res<TerrainPaintState>,
+    mode: Res<TerrainEditMode>,
+    selection: Res<Selection>,
     splat: Res<super::splat::TerrainSplatMaterials>,
     region_view: Res<TerrainRegionView>,
 ) {
@@ -147,22 +207,30 @@ fn sync_terrain_surface(
         return;
     };
 
-    let fallback = match &material_res {
-        Some(res) => res.0.clone(),
+    let (fallback, mask_material) = match &material_res {
+        Some(res) => (res.fallback.clone(), res.detail_mask.clone()),
         None => {
             // No depth_bias needed: the editor grid yields to opaque
             // geometry at its own plane (see `jackdaw_editor_core::editor_grid`).
-            let handle = materials.add(StandardMaterial {
+            let fallback = materials.add(StandardMaterial {
                 base_color: Color::WHITE,
                 perceptual_roughness: 0.9,
                 metallic: 0.0,
                 ..default()
             });
-            commands.insert_resource(TerrainMaterialHandle(handle.clone()));
-            handle
+            let detail_mask = materials.add(StandardMaterial {
+                unlit: true,
+                ..default()
+            });
+            commands.insert_resource(TerrainMaterialHandles {
+                fallback: fallback.clone(),
+                detail_mask: detail_mask.clone(),
+            });
+            (fallback, detail_mask)
         }
     };
 
+    let detail_mask = detail_mask_target(&paint, &mode, &selection);
     for (terrain_entity, terrain, mut dirty) in &mut terrains {
         // The camera position in this terrain's grid coordinates: the
         // levels are laid out on the grid, so a moved or rotated terrain
@@ -182,7 +250,17 @@ fn sync_terrain_surface(
         let edited: Vec<(u32, u32)> = dirty.dirty.drain().collect();
         let heightmap = store.heightmap(terrain);
         let document = store.get(&terrain.data_path);
-        let splat_handle = splat.material(&terrain.data_path);
+        let mask = detail_mask
+            .filter(|(entity, _, _)| *entity == terrain_entity)
+            .zip(document)
+            .and_then(|((_, index, map), data)| {
+                Some((data, detail_mask_binding(terrain, data, index, map)?))
+            });
+        let (splat_handle, surface_material) = if mask.is_some() {
+            (None, &mask_material)
+        } else {
+            (splat.material(&terrain.data_path), &fallback)
+        };
 
         let mut existing: Vec<(Entity, u32, ClipmapLevel, Handle<Mesh>)> = surfaces
             .iter()
@@ -280,7 +358,20 @@ fn sync_terrain_surface(
             } else {
                 data
             };
-            let colors = surface_vertex_colors(terrain, &store, &paint, &data.grid);
+            let colors = match mask {
+                Some((document, mask)) => data
+                    .grid
+                    .iter()
+                    .map(|&[x, z]| {
+                        let (value, ceiling) =
+                            mask.channel.map_or((0, 255), |(channel, ceiling)| {
+                                (document.regions.grid_channel(channel, x, z), ceiling)
+                            });
+                        detail_mask_color(mask.map, value, ceiling)
+                    })
+                    .collect(),
+                None => surface_vertex_colors(terrain, &store, &paint, &data.grid),
+            };
             let mut rebuilt = Some(build_bevy_mesh(data, colors));
 
             // Write over the mesh this level owns rather than minting
@@ -305,6 +396,7 @@ fn sync_terrain_surface(
                             terrain_entity,
                             level: level.level,
                         },
+                        jackdaw_terrain::render::TerrainDrawSurface(terrain_entity),
                         Transform::default(),
                         Visibility::default(),
                         ChildOf(terrain_entity),
@@ -315,7 +407,7 @@ fn sync_terrain_surface(
             if let Some(handle) = fresh {
                 entity.insert(Mesh3d(handle));
             }
-            point_at_material(&mut entity, &splat_handle, &fallback);
+            point_at_material(&mut entity, &splat_handle, surface_material);
         }
 
         // Every level this terrain still has, not only the ones this frame
@@ -323,7 +415,11 @@ fn sync_terrain_surface(
         // hole, would otherwise keep the handle it was given when it was last
         // built whole.
         for (entity, _, _, _) in &existing {
-            point_at_material(&mut commands.entity(*entity), &splat_handle, &fallback);
+            point_at_material(
+                &mut commands.entity(*entity),
+                &splat_handle,
+                surface_material,
+            );
         }
     }
 }
@@ -423,6 +519,52 @@ fn surface_vertex_colors(
         .collect()
 }
 
+fn detail_mask_color(map: DetailPaintMap, value: u16, ceiling: u16) -> [f32; 4] {
+    match map {
+        DetailPaintMap::Density => density_mask_color(value, ceiling),
+        DetailPaintMap::Height => {
+            let value = 1.0 - f32::from(value.min(255)) / 255.0;
+            [
+                0.04 + 0.75 * value,
+                0.07 + 0.77 * value,
+                0.13 + 0.77 * value,
+                1.0,
+            ]
+        }
+        DetailPaintMap::Color => {
+            let [r, g, b] = jackdaw_terrain::channel::decode_detail_tint(value)
+                .map(|byte| f32::from(byte) / 255.0);
+            Color::srgb(r, g, b).to_linear().to_f32_array()
+        }
+        DetailPaintMap::Species => {
+            const PALETTE: [[f32; 4]; 8] = [
+                [0.07, 0.43, 0.15, 1.0],
+                [0.73, 0.14, 0.58, 1.0],
+                [0.84, 0.45, 0.07, 1.0],
+                [0.13, 0.41, 0.84, 1.0],
+                [0.76, 0.11, 0.10, 1.0],
+                [0.06, 0.71, 0.67, 1.0],
+                [0.71, 0.64, 0.14, 1.0],
+                [0.42, 0.23, 0.69, 1.0],
+            ];
+            PALETTE
+                .get(usize::from(value))
+                .copied()
+                .unwrap_or([1.0, 0.0, 1.0, 1.0])
+        }
+    }
+}
+
+fn density_mask_color(value: u16, ceiling: u16) -> [f32; 4] {
+    let density = f32::from(value.min(ceiling)) / f32::from(ceiling);
+    [
+        0.035 + 0.095 * density,
+        0.045 + 0.755 * density,
+        0.055 + 0.445 * density,
+        1.0,
+    ]
+}
+
 fn build_bevy_mesh(data: jackdaw_terrain::SurfaceMeshData, colors: Vec<[f32; 4]>) -> Mesh {
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
     debug_assert_eq!(
@@ -469,6 +611,8 @@ mod tests {
         world.insert_resource(Assets::<Mesh>::default());
         world.insert_resource(Assets::<StandardMaterial>::default());
         world.insert_resource(TerrainPaintState::default());
+        world.insert_resource(TerrainEditMode::default());
+        world.insert_resource(Selection::default());
         world.insert_resource(ActiveViewport::default());
         world.insert_resource(super::super::splat::TerrainSplatMaterials::default());
         world.insert_resource(super::super::regions::TerrainRegionView::default());
@@ -594,6 +738,69 @@ mod tests {
         levels
     }
 
+    #[test]
+    fn detail_mask_draws_the_selected_density_and_restores_the_splat_material() {
+        use bevy::mesh::VertexAttributeValues;
+        use jackdaw_terrain::{ChannelData, ChannelElement};
+
+        let resolution = 17;
+        let heights = vec![0.0; (resolution * resolution) as usize];
+        let (mut world, terrain) = world_with_terrain(resolution, heights.clone());
+        let mut grass = ChannelData::new("grass", ChannelElement::U8, resolution);
+        grass.values.fill(128);
+        let document = RegionTerrainData::from_legacy_v1(&TerrainData {
+            resolution,
+            heights,
+            channels: vec![grass],
+        })
+        .expect("fixture document");
+        world
+            .resource_mut::<TerrainDataStore>()
+            .insert("a.jdterrain", document);
+        world
+            .get_mut::<jackdaw_scene_types::Terrain>(terrain)
+            .unwrap()
+            .detail = vec![jackdaw_scene_types::DetailLayer {
+            density_channel: "grass".into(),
+            ..default()
+        }];
+        let material =
+            Assets::<jackdaw_terrain::render::TerrainSplatMaterial>::default().reserve_handle();
+        world
+            .resource_mut::<super::super::splat::TerrainSplatMaterials>()
+            .set_test_material("a.jdterrain", material);
+        world.resource_mut::<Selection>().entities.push(terrain);
+        world.insert_resource(TerrainEditMode::Paint);
+        let mut paint = world.resource_mut::<TerrainPaintState>();
+        paint.domain = PaintDomain::Detail;
+        paint.detail_overlay = Some(DetailPaintMap::Density);
+
+        world
+            .run_system_cached(rebuild_on_channel_view_change)
+            .unwrap();
+        run(&mut world);
+        assert!(surfaces_on_splat(&mut world).is_empty());
+        let meshes = surface_meshes(&mut world);
+        assert!(!meshes.is_empty());
+        let assets = world.resource::<Assets<Mesh>>();
+        for (_, handle) in meshes {
+            let Some(VertexAttributeValues::Float32x4(colors)) = assets
+                .get(&handle)
+                .and_then(|mesh| mesh.attribute(Mesh::ATTRIBUTE_COLOR))
+            else {
+                panic!("missing density mask colors");
+            };
+            assert!(colors.contains(&density_mask_color(128, 255)));
+        }
+
+        world.insert_resource(TerrainEditMode::None);
+        world
+            .run_system_cached(rebuild_on_channel_view_change)
+            .unwrap();
+        run(&mut world);
+        assert_eq!(surfaces_on_splat(&mut world), levels_of_all(&mut world));
+    }
+
     /// Every standing level, in level order.
     fn levels_of_all(world: &mut World) -> Vec<u32> {
         let mut query = world.query::<&TerrainSurface>();
@@ -709,6 +916,8 @@ mod tests {
         world.insert_resource(Assets::<Mesh>::default());
         world.insert_resource(Assets::<StandardMaterial>::default());
         world.insert_resource(TerrainPaintState::default());
+        world.insert_resource(TerrainEditMode::default());
+        world.insert_resource(Selection::default());
         world.insert_resource(ActiveViewport::default());
         world.insert_resource(super::super::splat::TerrainSplatMaterials::default());
         world.insert_resource(super::super::regions::TerrainRegionView::default());

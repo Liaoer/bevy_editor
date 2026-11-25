@@ -978,6 +978,13 @@ fn spawn_detail_sections(
         &layer.name,
         DetailTextField("name"),
     );
+    spawn_detail_text_row(
+        commands,
+        section.body,
+        "Grass asset",
+        layer.grass_species.as_deref().unwrap_or(""),
+        DetailTextField("grass_species"),
+    );
     spawn_varieties(commands, section.body, layer);
     spawn_checkbox(
         commands,

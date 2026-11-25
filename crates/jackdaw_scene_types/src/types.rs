@@ -1252,6 +1252,14 @@ pub struct DetailLayer {
     /// Name of the [`TerrainChannel`] holding per-cell density. A cell reading
     /// zero grows nothing; the channel's ceiling is full density.
     pub density_channel: String,
+    /// Optional U8 channel storing the reduction from the authored blade height.
+    pub height_channel: Option<String>,
+    /// Optional U16 channel storing an inverse RGB565 grass tint.
+    pub color_channel: Option<String>,
+    /// Asset-root-relative .grass.json used by the GPU grass integration.
+    pub grass_species: Option<String>,
+    /// Optional U8 channel of zero-based types in the bound grass asset.
+    pub type_channel: Option<String>,
     /// Legacy single mesh, read from scenes written before a layer carried
     /// [`Self::varieties`].
     ///
@@ -1429,6 +1437,10 @@ impl Default for DetailLayer {
         Self {
             name: "grass".to_string(),
             density_channel: "grass".to_string(),
+            height_channel: None,
+            color_channel: None,
+            grass_species: None,
+            type_channel: None,
             mesh: DetailMesh::Card,
             varieties: vec![DetailVariety::default()],
             height: [0.35, 0.7],

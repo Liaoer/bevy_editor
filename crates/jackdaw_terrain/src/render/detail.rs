@@ -122,6 +122,10 @@ pub struct DetailLayerSource {
     pub density: Vec<u16>,
     /// The density channel's ceiling: a cell reading this is full coverage.
     pub max: u16,
+    /// Optional appearance channels for a runtime grass asset.
+    pub grass_height: Option<Vec<u16>>,
+    pub grass_color: Option<Vec<u16>>,
+    pub grass_types: Option<Vec<u16>>,
     /// How the layer reads.
     pub layer: DetailLayer,
     /// What the placement is seeded from: the grid's placement and the density
@@ -155,9 +159,20 @@ impl TerrainDetailSource {
                 };
                 let mut layer = layer.clone();
                 layer.take_legacy_mesh();
+                let grass_map = |name: Option<&str>, element| {
+                    layer.grass_species.as_ref()?;
+                    let name = name?;
+                    let channel = data.channels.iter().position(|descriptor| {
+                        descriptor.name == name && descriptor.element == element
+                    })?;
+                    Some(data.regions.read_grid_channel(channel, grid.resolution))
+                };
                 DetailLayerSource {
                     density,
                     max,
+                    grass_height: grass_map(layer.height_channel.as_deref(), ChannelElement::U8),
+                    grass_color: grass_map(layer.color_channel.as_deref(), ChannelElement::U16),
+                    grass_types: grass_map(layer.type_channel.as_deref(), ChannelElement::U8),
                     seed: seed_of(&grid, &layer.density_channel),
                     layer,
                 }
@@ -183,6 +198,31 @@ impl TerrainDetailSource {
     /// What the tiles are seeded from.
     pub fn source(&self) -> &DetailSource {
         &self.0
+    }
+
+    /// Update the projected density plane of every layer using this channel.
+    /// A shared snapshot can be replaced by the caller's normal projection.
+    pub fn patch_density(
+        &mut self,
+        document: &RegionTerrainData,
+        channel: usize,
+        rect: GridRect,
+    ) -> bool {
+        let Some(source) = Arc::get_mut(&mut self.0) else {
+            return false;
+        };
+        let descriptor = &document.channels[channel];
+        let mut values = None;
+        for entry in &mut source.layers {
+            if entry.layer.density_channel == descriptor.name {
+                rect.write(
+                    &mut entry.density,
+                    source.grid.resolution,
+                    values.get_or_insert_with(|| document.regions.channel_rect(channel, rect)),
+                );
+            }
+        }
+        true
     }
 
     /// World units per grid cell edge.
@@ -883,6 +923,7 @@ fn rebuild_detail_tiles(
         for (index, entry) in source.source().layers.iter().enumerate() {
             let cull_cells = entry.layer.cull_distance * settings.cull_scale / cell_size;
             let wanted = detail_tiles_around(viewer_cell, cull_cells, DETAIL_TILE_CELLS);
+            let wanted_coords: HashSet<_> = wanted.iter().map(|(coord, _)| *coord).collect();
 
             let mut standing = HashSet::new();
             let mut relevelled: HashMap<IVec2, Vec<Entity>> = HashMap::new();
@@ -895,7 +936,7 @@ fn rebuild_detail_tiles(
                     cull_cells,
                     Some(tile.lod),
                 );
-                let retired = !wanted.iter().any(|(coord, _)| *coord == tile.tile)
+                let retired = !wanted_coords.contains(&tile.tile)
                     || stale.is_some_and(|rect| touches(rect, tile.tile));
                 if retired {
                     commands.entity(tile_entity).despawn();

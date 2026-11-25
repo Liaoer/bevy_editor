@@ -25,43 +25,71 @@ pub(crate) fn mark_detail_dirty(world: &mut World, entity: Entity, rect: GridRec
     }
 }
 
+#[derive(Component)]
+pub struct DetailProjectionRevision(Option<u64>);
+
 /// Keep every terrain's detail source following its document and its layers.
 /// The whole field is marked stale only for a change no per-cell mark covers.
 pub fn sync_terrain_detail(
     mut commands: Commands,
     store: Res<TerrainDataStore>,
-    terrains: Query<(
+    mut terrains: Query<(
         Entity,
         Ref<jackdaw_scene_types::Terrain>,
-        Option<&TerrainDetailSource>,
+        Option<&mut TerrainDetailSource>,
         Option<&DetailDirty>,
+        Option<&DetailProjectionRevision>,
     )>,
 ) {
     let store_changed = store.is_changed();
-    for (entity, terrain, held, marked) in &terrains {
+    for (entity, terrain, mut held, marked, projected_revision) in &mut terrains {
         let carries_layers = !terrain.detail.is_empty();
         if !store_changed && !terrain.is_changed() && held.is_some() == carries_layers {
             continue;
         }
 
-        let projected = store
-            .get(&terrain.data_path)
-            .and_then(|data| TerrainDetailSource::from_document(data, &terrain));
+        let document = store.get(&terrain.data_path);
+        let revision = store.edit_revision(&terrain.data_path);
+        if !terrain.is_changed()
+            && let (Some(source), Some(at), Some(edit), Some(document)) = (
+                held.as_deref_mut(),
+                projected_revision,
+                store.density_edit(&terrain.data_path),
+                document,
+            )
+            && source.source().grid == document.grid_shape(terrain.size, terrain.resolution)
+        {
+            if at.0 == revision {
+                continue;
+            }
+            if at.0 == edit.before && source.patch_density(document, edit.channel, edit.rect) {
+                let mut dirty = marked.copied().unwrap_or_default();
+                dirty.touch(edit.rect);
+                commands
+                    .entity(entity)
+                    .insert((dirty, DetailProjectionRevision(revision)));
+                continue;
+            }
+        }
+
+        let projected =
+            document.and_then(|data| TerrainDetailSource::from_document(data, &terrain));
         let Some(projected) = projected else {
             if held.is_some() {
                 commands
                     .entity(entity)
-                    .remove::<(TerrainDetailSource, DetailDirty)>();
+                    .remove::<(TerrainDetailSource, DetailDirty, DetailProjectionRevision)>();
             }
             continue;
         };
 
-        let reseeds = match held {
+        let reseeds = match held.as_deref() {
             Some(held) => reseeds_field(held.source(), projected.source()),
             None => true,
         };
-        let layers_changed =
-            held.is_none_or(|held| looks_of(held.source()) != looks_of(projected.source()));
+        let layers_changed = held
+            .as_deref()
+            .is_none_or(|held| looks_of(held.source()) != looks_of(projected.source()));
         if !store_changed && !layers_changed && !reseeds {
             continue;
         }
@@ -69,7 +97,11 @@ pub fn sync_terrain_detail(
         if reseeds {
             merged_mark.touch(GridRect::whole(projected.source().grid.resolution));
         }
-        commands.entity(entity).insert((projected, merged_mark));
+        commands.entity(entity).insert((
+            projected,
+            merged_mark,
+            DetailProjectionRevision(revision),
+        ));
     }
 }
 

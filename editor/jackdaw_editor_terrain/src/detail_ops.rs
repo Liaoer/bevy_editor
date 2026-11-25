@@ -12,7 +12,9 @@ use jackdaw_scene_types::{
 };
 
 use super::detail::mark_detail_dirty;
-use super::paint::{PaintDomain, SetTerrainChannel, TerrainPaintState};
+use super::paint::{
+    DetailPaintMap, DetailPreviewLod, PaintDomain, SetTerrainChannel, TerrainPaintState,
+};
 use super::scatter::resolve_terrain;
 use super::stamp_ops::{StampTarget, stamp_target};
 use super::store::TerrainDataStore;
@@ -26,6 +28,7 @@ pub(crate) fn add_to_extension(ctx: &mut ExtensionContext) {
         .register_operator::<TerrainDetailVarietyAddOp>()
         .register_operator::<TerrainDetailVarietyRemoveOp>()
         .register_operator::<TerrainDetailPaintOp>()
+        .register_operator::<TerrainDetailViewOp>()
         .register_operator::<TerrainDetailStampOp>();
 }
 
@@ -166,6 +169,7 @@ pub(crate) fn terrain_detail_add(
                 Box::new(AddTerrainChannel {
                     entity,
                     name,
+                    element: TerrainChannelElement::U8,
                     palette: Vec::new(),
                 }),
                 world,
@@ -296,7 +300,7 @@ pub(crate) fn terrain_detail_select(
         ),
         field(
             String,
-            doc = "Which field: name, density_channel, height, width, color_base, \
+            doc = "Which field: name, density_channel, grass_species, height, width, color_base, \
                    color_tip, wind_response, bend, push_strength, push_radius, \
                    density_per_m2, cull_distance or align_to_normal on the layer; mesh, \
                    weight, tint or height_scale on one of its varieties."
@@ -529,7 +533,7 @@ pub(crate) fn terrain_detail_variety_remove(
 #[operator(
     id = "terrain.detail.paint",
     label = "Paint Detail",
-    description = "Point the paint brush at a detail layer's density.",
+    description = "Choose the detail layer's density, height, color or species brush.",
     allows_undo = false,
     params(
         terrain(String, doc = "Name of the terrain entity. Defaults to the selection."),
@@ -548,6 +552,13 @@ pub(crate) fn terrain_detail_variety_remove(
             doc = "Thin cells out rather than thicken them. Omit to flip the current \
                    direction."
         ),
+        map(
+            String,
+            doc = "Density, height, color or species. Omit to keep the current brush."
+        ),
+        height(f64, doc = "Grass height to paint as a percentage, 0–100."),
+        color(String, doc = "Grass tint to paint, as #rrggbb."),
+        species(i64, doc = "Zero-based grass type slot in the bound asset.")
     )
 )]
 pub(crate) fn terrain_detail_paint(
@@ -564,14 +575,207 @@ pub(crate) fn terrain_detail_paint(
     };
     let opacity = params.as_float("opacity");
     let erase = params.as_bool("erase");
+    let map = match params.as_str("map") {
+        None => None,
+        Some(name) => {
+            let Some(map) = DetailPaintMap::parse(name) else {
+                warn_caller(
+                    world,
+                    "terrain.detail.paint: map must be density, height, color or species",
+                );
+                return OperatorResult::Cancelled;
+            };
+            Some(map)
+        }
+    };
+    let color = match params.as_str("color") {
+        None => None,
+        Some(raw) => {
+            let raw = raw.trim().trim_start_matches('#');
+            let color = (raw.len() == 6)
+                .then(|| u32::from_str_radix(raw, 16).ok())
+                .flatten();
+            let Some(color) = color else {
+                warn_caller(world, "terrain.detail.paint: color must look like #dfad54");
+                return OperatorResult::Cancelled;
+            };
+            let [_, r, g, b] = color.to_be_bytes();
+            Some([r, g, b])
+        }
+    };
+    let slot = params.as_int("species");
+    if slot.is_some_and(|slot| !(0..8).contains(&slot)) {
+        warn_caller(
+            world,
+            "terrain.detail.paint: species slot must be between 0 and 7",
+        );
+        return OperatorResult::Cancelled;
+    }
     let mut paint = world.resource_mut::<TerrainPaintState>();
     paint.domain = PaintDomain::Detail;
     paint.detail_layer = index;
+    if let Some(slot) = slot {
+        paint.detail_species_slot = slot as u8;
+    }
+    if let Some(map) = map {
+        paint.detail_map = map;
+    }
     if let Some(opacity) = opacity {
         paint.detail_opacity = (opacity as f32).clamp(0.01, 1.0);
     }
-    paint.detail_erase = erase.unwrap_or(!paint.detail_erase);
+    if let Some(height) = params
+        .as_float("height")
+        .filter(|height| height.is_finite())
+    {
+        paint.detail_height_percent = height.clamp(0.0, 100.0) as f32;
+    }
+    if let Some(color) = color {
+        paint.detail_color = color;
+    }
+    paint.detail_erase =
+        erase.unwrap_or(map.is_none() && color.is_none() && slot.is_none() && !paint.detail_erase);
     OperatorResult::Finished
+}
+
+#[operator(
+    id = "terrain.detail.view",
+    label = "Set Detail Brush Preview",
+    description = "Switch the terrain overlay and fix the GPU grass LOD while painting.",
+    allows_undo = false,
+    params(
+        overlay(String, doc = "Off, density, height, color or species."),
+        lod(
+            String,
+            doc = "Auto, near, middle or far. Applies in Detail paint mode."
+        )
+    )
+)]
+pub(crate) fn terrain_detail_view(
+    params: In<OperatorParameters>,
+    world: &mut World,
+) -> OperatorResult {
+    let overlay = match params.0.as_str("overlay") {
+        None => None,
+        Some("off") => Some(None),
+        Some(name) => {
+            let Some(map) = DetailPaintMap::parse(name) else {
+                warn_caller(
+                    world,
+                    "terrain.detail.view: expected overlay off, density, height, color or species",
+                );
+                return OperatorResult::Cancelled;
+            };
+            Some(Some(map))
+        }
+    };
+    let lod = match params.0.as_str("lod") {
+        None => None,
+        Some("auto") => Some(DetailPreviewLod::Auto),
+        Some("near") => Some(DetailPreviewLod::Near),
+        Some("middle") => Some(DetailPreviewLod::Middle),
+        Some("far") => Some(DetailPreviewLod::Far),
+        Some(_) => {
+            warn_caller(
+                world,
+                "terrain.detail.view: expected LOD auto, near, middle or far",
+            );
+            return OperatorResult::Cancelled;
+        }
+    };
+    let mut paint = world.resource_mut::<TerrainPaintState>();
+    if let Some(overlay) = overlay {
+        paint.detail_overlay = overlay;
+    }
+    if let Some(lod) = lod {
+        paint.detail_preview_lod = lod;
+    }
+    OperatorResult::Finished
+}
+
+/// Create the appearance channel on first use. A brush stroke is a separate
+/// history entry and can use the same rectangular undo as a density stroke.
+pub(crate) fn prepare_appearance_channel(
+    world: &mut World,
+    entity: Entity,
+    selected: usize,
+    map: DetailPaintMap,
+) -> bool {
+    let (suffix, element) = match map {
+        DetailPaintMap::Density => return true,
+        DetailPaintMap::Height => ("height", TerrainChannelElement::U8),
+        DetailPaintMap::Color => ("color", TerrainChannelElement::U16),
+        DetailPaintMap::Species => ("species", TerrainChannelElement::U8),
+    };
+    let Some(terrain) = world.get::<Terrain>(entity) else {
+        return false;
+    };
+    let Some(index) = super::detail::selected_detail_layer(terrain, selected) else {
+        return false;
+    };
+    if terrain.data_path.is_empty()
+        || world
+            .resource::<TerrainDataStore>()
+            .is_load_failed(&terrain.data_path)
+    {
+        return false;
+    }
+    let layer = &terrain.detail[index];
+    if map == DetailPaintMap::Species {
+        let paint = world.resource::<TerrainPaintState>();
+        if !paint
+            .detail_species_palette
+            .as_ref()
+            .is_some_and(|(asset, names)| {
+                layer.grass_species.as_ref() == Some(asset)
+                    && usize::from(paint.detail_species_slot) < names.len()
+            })
+        {
+            return false;
+        }
+    }
+    if let Some(existing) = map.channel(layer)
+        && let Some(channel) = terrain
+            .channels
+            .iter()
+            .find(|channel| channel.name == existing)
+    {
+        return channel.element == element;
+    }
+    let base = format!("{}-{suffix}", layer.name);
+    let name = std::iter::once(base.clone())
+        .chain((2..).map(|number| format!("{base}-{number}")))
+        .find(|name| terrain.channels.iter().all(|channel| channel.name != *name))
+        .expect("the candidate space is unbounded");
+    let before = terrain.detail.clone();
+    let mut after = before.clone();
+    match map {
+        DetailPaintMap::Height => after[index].height_channel = Some(name.clone()),
+        DetailPaintMap::Color => after[index].color_channel = Some(name.clone()),
+        DetailPaintMap::Species => after[index].type_channel = Some(name.clone()),
+        DetailPaintMap::Density => return true,
+    }
+    world.resource_scope(|world, mut history: Mut<CommandHistory>| {
+        let span = history.begin_span();
+        history.execute(
+            Box::new(AddTerrainChannel {
+                entity,
+                name,
+                element,
+                palette: Vec::new(),
+            }),
+            world,
+        );
+        history.execute(
+            Box::new(SetTerrainDetail {
+                entity,
+                before,
+                after,
+            }),
+            world,
+        );
+        history.end_span(span, "Add Grass Appearance Channel");
+    });
+    true
 }
 
 /// Thicken one layer's density once at a named place, as a released stroke
@@ -593,7 +797,7 @@ pub(crate) fn terrain_detail_paint(
         radius(f64, doc = "Brush radius in metres."),
         opacity(
             f64,
-            doc = "How far each cell crosses toward full cover, 0..1. Defaults to 1, \
+            doc = "How far each cell crosses toward the target, 0..1. Defaults to 1, \
                    a full-strength stamp."
         ),
         hardness(
@@ -606,6 +810,10 @@ pub(crate) fn terrain_detail_paint(
             doc = "Edge falloff power: 1 is linear, 2 is quadratic. Defaults to 2."
         ),
         erase(bool, doc = "Thin the cells out rather than thicken them."),
+        density(
+            f64,
+            doc = "Target coverage, 0..1. Defaults to 1 when painting and 0 when erasing."
+        ),
     )
 )]
 pub(crate) fn terrain_detail_stamp(
@@ -633,6 +841,9 @@ pub(crate) fn terrain_detail_stamp(
     let opacity = params.as_float("opacity").unwrap_or(1.0) as f32;
     let hardness = params.as_float("hardness").unwrap_or(0.5) as f32;
     let erase = params.as_bool("erase").unwrap_or(false);
+    let density = params
+        .as_float("density")
+        .unwrap_or(if erase { 0.0 } else { 1.0 }) as f32;
 
     let outcome = world.resource_scope(|world, mut store: Mut<TerrainDataStore>| {
         let Some(mut data) = store.entry_for(&terrain) else {
@@ -660,7 +871,7 @@ pub(crate) fn terrain_detail_stamp(
         let before = data.channel_values(channel);
         let mut values = before.clone();
         let one_whole_application = 1.0;
-        let changed = jackdaw_terrain::apply_density_brush(
+        let changed = jackdaw_terrain::apply_density_brush_to(
             &mut values,
             placement.resolution,
             element,
@@ -671,6 +882,7 @@ pub(crate) fn terrain_detail_stamp(
             opacity,
             one_whole_application,
             erase,
+            density,
         );
         if changed == 0 {
             return Stamped::Unchanged;
@@ -692,6 +904,13 @@ pub(crate) fn terrain_detail_stamp(
         } => (channel, before, after),
     };
     mark_detail_dirty(world, target, rect);
+    if world
+        .get_resource::<TerrainPaintState>()
+        .is_some_and(|paint| paint.detail_overlay == Some(DetailPaintMap::Density))
+        && let Some(mut dirty) = world.get_mut::<super::TerrainDirtyChunks>(target)
+    {
+        dirty.rebuild_all = true;
+    }
     world
         .resource_mut::<CommandHistory>()
         .push_executed(Box::new(SetTerrainChannel {
@@ -783,6 +1002,19 @@ fn write_field(layer: &mut DetailLayer, variety: usize, field: &str, value: &str
             } else {
                 layer.density_channel = trimmed.to_string();
             }
+        }
+        "grass_species" => {
+            let value = value.trim().replace('\\', "/");
+            if !value.is_empty()
+                && (!value.ends_with(".grass.json")
+                    || value.contains([':', '#'])
+                    || !std::path::Path::new(&value)
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_))))
+            {
+                return false;
+            }
+            layer.grass_species = (!value.is_empty()).then_some(value);
         }
         "align_to_normal" => match value.trim() {
             "true" => layer.align_to_normal = true,
@@ -906,6 +1138,7 @@ impl EditorCommand for SetTerrainDetail {
 pub(super) struct AddTerrainChannel {
     pub(super) entity: Entity,
     pub(super) name: String,
+    pub(super) element: TerrainChannelElement,
     /// Values the channel offers a brush. Empty is continuous coverage,
     /// which is what a detail layer's density carries.
     pub(super) palette: Vec<TerrainPaletteEntry>,
@@ -928,7 +1161,7 @@ impl EditorCommand for AddTerrainChannel {
         }
         terrain.channels.push(TerrainChannel {
             name: self.name.clone(),
-            element: TerrainChannelElement::U8,
+            element: self.element,
             palette: self.palette.clone(),
         });
         super::channel_ops::commit_channels(world, entity);

@@ -1,0 +1,59 @@
+[package]
+name = "jackdaw_grass_preview"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+resolver = "3"
+members = ["grass"]
+
+[dependencies]
+bevy = { git = "https://github.com/bevyengine/bevy", branch = "main" }
+bevy_grass = { path = "grass" }
+jackdaw = { path = "../.." }
+jackdaw_api = { path = "../../crates/jackdaw_api" }
+jackdaw_api_internal = { path = "../../crates/jackdaw_api_internal" }
+jackdaw_runtime = { path = "../../crates/jackdaw_runtime", features = ["terrain"] }
+jackdaw_scene_types = { path = "../../crates/jackdaw_scene_types" }
+jackdaw_terrain = { path = "../../crates/jackdaw_terrain" }
+serde_json = "1"
+
+[profile.dev]
+opt-level = 1
+lto = "off"
+incremental = false
+debug = "line-tables-only"
+
+[profile.dev.package.jackdaw]
+incremental = true
+
+[profile.dev.package.jackdaw_editor_core]
+incremental = true
+
+[profile.dev.package.jackdaw_editor_tile]
+incremental = true
+
+[profile.dev.package.jackdaw_editor_terrain]
+incremental = true
+
+[profile.dev.package.jackdaw_editor_modelling]
+incremental = true
+
+[profile.dev.package.jackdaw_editor_remote]
+incremental = true
+
+[profile.dev.package.jackdaw_editor_animation]
+incremental = true
+
+[profile.dev.package.jackdaw_editor_launcher]
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.wgpu-types]
+debug-assertions = false
+
+[profile.dev.package.bevy_ptr]
+debug-assertions = false

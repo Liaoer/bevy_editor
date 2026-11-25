@@ -25,7 +25,10 @@ use super::ui_fields::{
     FieldKind, TerrainDefaultFontRoot, spawn_add_tile, spawn_bar_swatch, spawn_checkbox,
     spawn_hint, spawn_scrub_chip, spawn_tile, spawn_tile_grid, spawn_tile_remove,
 };
-use super::{PaintDomain, TerrainBrushSettings, TerrainEditMode, TerrainPaintState};
+use super::{
+    DetailPaintMap, DetailPreviewLod, PaintDomain, TerrainBrushSettings, TerrainEditMode,
+    TerrainPaintState,
+};
 use jackdaw_api::terrain::TerrainToolOptions;
 use jackdaw_editor_core::selection::Selection;
 
@@ -161,6 +164,9 @@ enum TextureField {
     VariationAmount,
     /// How fast a detail stroke thickens the cells under it.
     DetailOpacity,
+    DetailPaintPercent,
+    DetailErasePercent,
+    DetailHeightPercent,
 }
 
 /// What the bar last rendered, so it rebuilds only on a structural change
@@ -212,6 +218,13 @@ struct TextureBarSignature {
     /// Which detail layer the bar is naming, so it rebuilds when the selection
     /// moves to another one.
     detail_layer: usize,
+    detail_map: DetailPaintMap,
+    detail_overlay: Option<DetailPaintMap>,
+    detail_preview_lod: DetailPreviewLod,
+    detail_gpu_preview_active: bool,
+    species_asset: Option<String>,
+    species_palette: Option<(String, Vec<String>)>,
+    species_slot: u8,
 }
 
 fn update_options_bar_content(
@@ -266,6 +279,18 @@ fn update_options_bar_content(
         restore_auto: paint_state.restore_auto,
         detail_erase: paint_state.detail_erase,
         detail_layer: paint_state.detail_layer,
+        detail_map: paint_state.detail_map,
+        detail_overlay: paint_state.detail_overlay,
+        detail_preview_lod: paint_state.detail_preview_lod,
+        detail_gpu_preview_active: paint_state.detail_gpu_preview_active,
+        species_asset: selected_terrain
+            .and_then(|terrain| {
+                super::detail::selected_detail_layer(terrain, paint_state.detail_layer)
+                    .map(|index| &terrain.detail[index])
+            })
+            .and_then(|layer| layer.grass_species.clone()),
+        species_palette: paint_state.detail_species_palette.clone(),
+        species_slot: paint_state.detail_species_slot,
     });
 
     let region_signature = (*edit_mode == TerrainEditMode::Regions).then(|| RegionBarSignature {
@@ -683,6 +708,42 @@ fn spawn_detail_paint_bar(
         return;
     };
     spawn_hint(commands, parent, &format!("Layer: {}", layer.name));
+    let mut maps = vec![
+        DetailPaintMap::Density,
+        DetailPaintMap::Height,
+        DetailPaintMap::Color,
+    ];
+    if layer.grass_species.is_some() {
+        maps.push(DetailPaintMap::Species);
+    }
+    let chosen = maps
+        .iter()
+        .position(|map| *map == paint.detail_map)
+        .unwrap_or(0);
+    commands
+        .spawn((
+            combobox::combobox_with_selected(
+                maps.iter().map(|map| map.label().to_string()).collect(),
+                chosen,
+            ),
+            ChildOf(parent),
+        ))
+        .observe(|event: On<ComboBoxChangeEvent>, mut commands: Commands| {
+            let map = match event.selected {
+                1 => "height",
+                2 => "color",
+                3 => "species",
+                _ => "density",
+            };
+            commands
+                .operator(crate::detail_ops::TerrainDetailPaintOp::ID)
+                .param("map", map)
+                .settings(CallOperatorSettings {
+                    creates_history_entry: false,
+                    execution_context: ExecutionContext::Invoke,
+                })
+                .call();
+        });
     spawn_scrub_chip(
         commands,
         parent,
@@ -707,12 +768,110 @@ fn spawn_detail_paint_bar(
         commands,
         parent,
         "Opacity",
-        "How far a cell crosses toward full cover per second at full brush strength",
+        "How quickly cells approach the brush target at full strength",
         paint.detail_opacity,
         0.01..1.0,
         FieldKind::Continuous,
         TextureField::DetailOpacity,
     );
+    if paint.detail_map == DetailPaintMap::Height {
+        spawn_scrub_chip(
+            commands,
+            parent,
+            "Grass Height %",
+            "Blade length as a percentage of the layer's height. Ctrl restores full height.",
+            paint.detail_height_percent,
+            0.0..100.0,
+            FieldKind::Count,
+            TextureField::DetailHeightPercent,
+        );
+    } else if paint.detail_map == DetailPaintMap::Color {
+        let [r, g, b] = paint.detail_color.map(|byte| f32::from(byte) / 255.0);
+        commands
+            .spawn((
+                jackdaw_feathers::color_picker::color_picker(
+                    jackdaw_feathers::color_picker::ColorPickerProps::new()
+                        .with_color([r, g, b, 1.0]),
+                ),
+                ChildOf(parent),
+            ))
+            .observe(
+                |event: On<jackdaw_feathers::color_picker::ColorPickerChangeEvent>,
+                 mut paint: ResMut<TerrainPaintState>| {
+                    let [r, g, b, _] = event.color;
+                    paint.detail_color = [r, g, b]
+                        .map(|component| (component.clamp(0.0, 1.0) * 255.0).round() as u8);
+                },
+            );
+    }
+    if paint.detail_map == DetailPaintMap::Species {
+        if let Some((_, names)) = paint
+            .detail_species_palette
+            .as_ref()
+            .filter(|(asset, _)| layer.grass_species.as_ref() == Some(asset))
+        {
+            commands
+                .spawn((
+                    combobox::combobox_with_selected(
+                        names.clone(),
+                        usize::from(paint.detail_species_slot),
+                    ),
+                    ChildOf(parent),
+                ))
+                .observe(|event: On<ComboBoxChangeEvent>, mut commands: Commands| {
+                    commands
+                        .operator(crate::detail_ops::TerrainDetailPaintOp::ID)
+                        .param("species", event.selected as i64)
+                        .settings(CallOperatorSettings {
+                            creates_history_entry: false,
+                            execution_context: ExecutionContext::Invoke,
+                        })
+                        .call();
+                });
+        } else {
+            spawn_hint(
+                commands,
+                parent,
+                "Load the bound Grass asset in GPU Grass Preview.",
+            );
+        }
+    }
+    spawn_detail_view_controls(commands, parent, paint);
+    if paint.detail_map != DetailPaintMap::Density {
+        spawn_checkbox(
+            commands,
+            parent,
+            "Restore",
+            paint.detail_erase,
+            DetailEraseCheckbox,
+        );
+        return;
+    }
+    for (label, description, percent, field) in [
+        (
+            "Paint to %",
+            "Add grass up to this coverage. Denser areas are unaffected.",
+            paint.detail_paint_percent,
+            TextureField::DetailPaintPercent,
+        ),
+        (
+            "Erase to %",
+            "Thin grass to this coverage when using Erase or Ctrl. Sparser areas are unaffected.",
+            paint.detail_erase_percent,
+            TextureField::DetailErasePercent,
+        ),
+    ] {
+        spawn_scrub_chip(
+            commands,
+            parent,
+            label,
+            description,
+            percent,
+            0.0..100.0,
+            FieldKind::Count,
+            field,
+        );
+    }
     spawn_checkbox(
         commands,
         parent,
@@ -720,6 +879,71 @@ fn spawn_detail_paint_bar(
         paint.detail_erase,
         DetailEraseCheckbox,
     );
+}
+
+fn spawn_detail_view_controls(commands: &mut Commands, parent: Entity, paint: &TerrainPaintState) {
+    let overlay_selected = paint
+        .detail_overlay
+        .and_then(|map| DetailPaintMap::ALL.iter().position(|mode| *mode == map))
+        .map_or(0, |index| index + 1);
+    let options = std::iter::once("Overlay off".to_owned())
+        .chain(
+            DetailPaintMap::ALL
+                .into_iter()
+                .map(|mode| format!("Overlay · {}", mode.label())),
+        )
+        .collect();
+    commands
+        .spawn((
+            combobox::combobox_with_selected(options, overlay_selected),
+            ChildOf(parent),
+        ))
+        .observe(|event: On<ComboBoxChangeEvent>, mut commands: Commands| {
+            let name = event
+                .selected
+                .checked_sub(1)
+                .and_then(|index| DetailPaintMap::ALL.get(index))
+                .map_or("off", |map| map.id());
+            commands
+                .operator(crate::detail_ops::TerrainDetailViewOp::ID)
+                .param("overlay", name)
+                .settings(CallOperatorSettings {
+                    creates_history_entry: false,
+                    execution_context: ExecutionContext::Invoke,
+                })
+                .call();
+        });
+    if paint.detail_gpu_preview_active {
+        let selected = match paint.detail_preview_lod {
+            DetailPreviewLod::Auto => 0,
+            DetailPreviewLod::Near => 1,
+            DetailPreviewLod::Middle => 2,
+            DetailPreviewLod::Far => 3,
+        };
+        let options = ["LOD · Auto", "LOD · Near", "LOD · Middle", "LOD · Far"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        commands
+            .spawn((
+                combobox::combobox_with_selected(options, selected),
+                ChildOf(parent),
+            ))
+            .observe(|event: On<ComboBoxChangeEvent>, mut commands: Commands| {
+                let name = ["auto", "near", "middle", "far"]
+                    .get(event.selected)
+                    .copied()
+                    .unwrap_or("auto");
+                commands
+                    .operator(crate::detail_ops::TerrainDetailViewOp::ID)
+                    .param("lod", name)
+                    .settings(CallOperatorSettings {
+                        creates_history_entry: false,
+                        execution_context: ExecutionContext::Invoke,
+                    })
+                    .call();
+            });
+    }
 }
 
 /// The Texture-mode bar: brush radius and falloff, opacity, which texture is
@@ -1051,6 +1275,15 @@ fn on_scrub_value_change(
             TextureField::DetailOpacity => {
                 paint_state.detail_opacity = event.value.clamp(0.01, 1.0);
             }
+            TextureField::DetailPaintPercent => {
+                paint_state.detail_paint_percent = event.value.clamp(0.0, 100.0);
+            }
+            TextureField::DetailErasePercent => {
+                paint_state.detail_erase_percent = event.value.clamp(0.0, 100.0);
+            }
+            TextureField::DetailHeightPercent => {
+                paint_state.detail_height_percent = event.value.clamp(0.0, 100.0);
+            }
         }
         return;
     }
@@ -1173,6 +1406,9 @@ fn sync_texture_opacity_field(
                 TextureField::VariationFrequency => paint_state.variation_frequency,
                 TextureField::VariationAmount => paint_state.variation_amount,
                 TextureField::DetailOpacity => paint_state.detail_opacity,
+                TextureField::DetailPaintPercent => paint_state.detail_paint_percent,
+                TextureField::DetailErasePercent => paint_state.detail_erase_percent,
+                TextureField::DetailHeightPercent => paint_state.detail_height_percent,
             };
             (entity, value)
         })
@@ -1230,6 +1466,13 @@ mod tests {
                 restore_auto: false,
                 detail_erase: false,
                 detail_layer: 0,
+                detail_map: DetailPaintMap::Density,
+                detail_overlay: None,
+                detail_preview_lod: DetailPreviewLod::Auto,
+                detail_gpu_preview_active: false,
+                species_asset: None,
+                species_palette: None,
+                species_slot: 0,
             }),
             region_signature: None,
         }

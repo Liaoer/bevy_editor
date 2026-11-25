@@ -16,6 +16,7 @@
 // uniform control flow at the top of `fragment`: the per-layer branches below
 // make implicit-derivative sampling illegal.
 
+import jackdaw_terrain::render::shaders::terrain_horizon_blend::blend_far_grass;
 import bevy_pbr::render::{
     forward_io::{VertexOutput, FragmentOutput},
     mesh_bindings::mesh,
@@ -84,6 +85,7 @@ struct SplatUniform {
     // Bit i is set where texture id i has a roughness map. An id without
     // one takes `perceptual_roughness`.
     roughness_slots: u32,
+    horizon_params: vec4<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> splat: SplatUniform;
@@ -97,6 +99,9 @@ struct SplatUniform {
 @group(constants::MATERIAL_BIND_GROUP) @binding(8) var tint_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(9) var occlusion_array: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(10) var roughness_array: texture_2d_array<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(11) var horizon_color: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(12) var horizon_density: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(13) var horizon_length: texture_2d<f32>;
 
 // The last id this material can address: one short of the bound set's
 // layer count, and never past the UV-scale array. Every id is clamped
@@ -514,7 +519,9 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     // Mesh flags carry the shadow-receiver and transmitted-shadow-receiver
     // bits. Leaving them zero renders terrain that no shadow ever falls on.
     pbr_input.flags = mesh[in.instance_index].flags;
-    pbr_input.material.base_color = vec4<f32>(albedo, 1.0);
+    let terrain_color = blend_far_grass(albedo, in.world_position.xz, view.world_position.xz,
+        in.uv, splat.horizon_params, horizon_color, horizon_density, horizon_length, tint_sampler);
+    pbr_input.material.base_color = vec4<f32>(terrain_color, 1.0);
     pbr_input.material.perceptual_roughness = roughness;
     pbr_input.material.reflectance = vec3<f32>(reflectance);
     pbr_input.material.metallic = 0.0;

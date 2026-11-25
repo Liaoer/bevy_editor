@@ -726,6 +726,17 @@ impl TerrainRegions {
         })
     }
 
+    /// Exact channel cells in a rectangular patch, in row-major order.
+    pub fn channel_rect(&self, index: usize, rect: crate::GridRect) -> Vec<u16> {
+        let mut values = Vec::with_capacity(rect.cells());
+        for z in rect.z..rect.z + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                values.push(self.channel_at(index, x as i32, z as i32));
+            }
+        }
+        values
+    }
+
     /// Scatter a dense channel grid back across the regions that own it.
     ///
     /// Cell `(x, z)` of the grid is cell `(x, z)` of the terrain, so a
